@@ -168,10 +168,18 @@ EOF
 }
 
 # ------------------------------- github lookup ------------------------------
-gh_releases() {           # arg: owner/repo
-  curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 5 --max-time 45 \
-       -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
-       "https://api.github.com/repos/$1/releases?per_page=100"
+# curl with an automatic IPv4 retry: some hosts advertise an IPv6 default route that is actually
+# dead (e.g. release-assets.githubusercontent.com over a broken v6 path), which resets mid-transfer.
+gcurl() { curl "$@" || curl -4 "$@"; }
+
+gh_releases() {           # arg: owner/repo ; prints releases JSON
+  local url="https://api.github.com/repos/$1/releases?per_page=100" out
+  out="$(curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 5 --max-time 45 \
+         -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$url")" \
+   || out="$(curl -4 -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 5 --max-time 45 \
+         -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$url")" \
+   || return 1
+  printf '%s' "$out"
 }
 # From releases JSON on stdin, emit "tag<TAB>published<TAB>asset_url<TAB>hashes_url"
 # for the newest stable release (tag startswith prefix) that carries the asset. args: prefix asset
@@ -235,12 +243,12 @@ update_component() {
 
   local tmp rc=0; tmp="$(mktemp -d /tmp/nym-autoupdate.XXXXXX)"
   while :; do
-    if ! curl -fsSL --proto '=https' --proto-redir '=https' --retry 5 --retry-all-errors --retry-delay 5 --max-time 600 -o "$tmp/bin" "$url"; then
-      log "[$NAME] download failed (after retries); skip this cycle"; rc=0; break
+    if ! gcurl -fsSL --proto '=https' --proto-redir '=https' --retry 5 --retry-all-errors --retry-delay 5 --max-time 600 -o "$tmp/bin" "$url"; then
+      log "[$NAME] download failed (after retries over IPv6+IPv4); skip this cycle"; rc=0; break
     fi
 
     local want=""
-    if [[ -n "$hashurl" ]] && curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --max-time 60 -o "$tmp/hashes.json" "$hashurl"; then
+    if [[ -n "$hashurl" ]] && gcurl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-all-errors --max-time 60 -o "$tmp/hashes.json" "$hashurl"; then
       want="$(jq -r --arg a "$CASSET" '.assets[$a].sha256 // empty' "$tmp/hashes.json" 2>/dev/null || true)"
     fi
     if [[ -n "$want" ]]; then
@@ -338,8 +346,9 @@ detect_ntm() {            # echoes "<enabled>\t<path>\t<iface>"
 # stdout = matched lines; return 0 = relevant, 1 = not relevant, 2 = could not read/parse.
 changelog_mentions_ntm() {
   local tag="$1" cl ver section matched
-  cl="$(curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --max-time 45 \
-        "https://raw.githubusercontent.com/$REPO/$tag/CHANGELOG.md" 2>/dev/null)" || return 2
+  cl="$(curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --max-time 45 "https://raw.githubusercontent.com/$REPO/$tag/CHANGELOG.md" 2>/dev/null)" \
+    || cl="$(curl -4 -fsSL --proto '=https' --proto-redir '=https' --retry 3 --max-time 45 "https://raw.githubusercontent.com/$REPO/$tag/CHANGELOG.md" 2>/dev/null)" \
+    || return 2
   ver="${tag#${TAG_PREFIX}}"
   section="$(printf '%s\n' "$cl" | awk -v v="$ver" '
     $0 ~ "^## \\[" v "\\]" {f=1; next}
@@ -387,7 +396,7 @@ maybe_run_ntm() {
 
   local tmp rc=0; tmp="$(mktemp -d /tmp/nym-autoupdate-ntm.XXXXXX)"
   while :; do
-    if ! curl -fsSL --proto '=https' --proto-redir '=https' --retry 5 --retry-all-errors --retry-delay 5 --max-time 180 \
+    if ! gcurl -fsSL --proto '=https' --proto-redir '=https' --retry 5 --retry-all-errors --retry-delay 5 --max-time 180 \
            -o "$tmp/ntm.sh" "https://raw.githubusercontent.com/$REPO/$tag/$NTM_REPO_PATH"; then
       log "[ntm] could not download tag-pinned NTM for $tag; leaving the tunnel untouched"; rc=0; break
     fi
