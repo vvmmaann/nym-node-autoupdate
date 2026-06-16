@@ -235,8 +235,8 @@ update_component() {
 
   local tmp rc=0; tmp="$(mktemp -d /tmp/nym-autoupdate.XXXXXX)"
   while :; do
-    if ! curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 5 --max-time 300 -o "$tmp/bin" "$url"; then
-      log "[$NAME] download failed; skip"; rc=0; break
+    if ! curl -fsSL --proto '=https' --proto-redir '=https' --retry 5 --retry-all-errors --retry-delay 5 --max-time 600 -o "$tmp/bin" "$url"; then
+      log "[$NAME] download failed (after retries); skip this cycle"; rc=0; break
     fi
 
     local want=""
@@ -387,7 +387,7 @@ maybe_run_ntm() {
 
   local tmp rc=0; tmp="$(mktemp -d /tmp/nym-autoupdate-ntm.XXXXXX)"
   while :; do
-    if ! curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --max-time 120 \
+    if ! curl -fsSL --proto '=https' --proto-redir '=https' --retry 5 --retry-all-errors --retry-delay 5 --max-time 180 \
            -o "$tmp/ntm.sh" "https://raw.githubusercontent.com/$REPO/$tag/$NTM_REPO_PATH"; then
       log "[ntm] could not download tag-pinned NTM for $tag; leaving the tunnel untouched"; rc=0; break
     fi
