@@ -88,13 +88,28 @@ It detects your setup, asks you to confirm/correct it, copies itself to
 up). For unattended/batch installs across many hosts, set `NYM_ASSUME_YES=1` to skip the prompts
 and accept the detected values.
 
-Check it any time:
+See what it detected and the last known state (read-only, no root needed):
 
 ```bash
-sudo /usr/local/sbin/nym-node-autoupdate.sh status
+/usr/local/sbin/nym-node-autoupdate.sh status
 ```
 
-Run a check immediately (e.g. to test):
+Check by hand whether a newer release is available, **without installing anything**
+(read-only, no root needed - safe to run any time):
+
+```bash
+/usr/local/sbin/nym-node-autoupdate.sh check
+```
+
+Example output:
+
+```
+nym-node   : up to date (1.33.0, nym-binaries-v2026.11-xynomizithra)
+nym-bridge : UPDATE AVAILABLE -> bridge-binaries-v0.1.3   (last applied bridge-binaries-v0.1.2)
+tunnel(NTM): nym-binaries-v2026.11-xynomizithra changelog has no tunnel/port changes
+```
+
+Force an update check **and apply** right now (this is what the hourly timer runs):
 
 ```bash
 sudo /usr/local/sbin/nym-node-autoupdate.sh run

@@ -27,8 +27,9 @@
 #   nym-node-autoupdate.sh            # same as 'install' (interactive setup)
 #   nym-node-autoupdate.sh install    # detect, confirm/correct, save config, set up the timer
 #   nym-node-autoupdate.sh run        # one unattended check + update of every component
-#   nym-node-autoupdate.sh uninstall  # remove the timer (leaves config, state and binaries alone)
+#   nym-node-autoupdate.sh check      # read-only: report whether newer releases exist (installs nothing)
 #   nym-node-autoupdate.sh status     # print detected/configured setup and last known state
+#   nym-node-autoupdate.sh uninstall  # remove the timer (leaves config, state and binaries alone)
 #
 set -euo pipefail
 
@@ -567,6 +568,38 @@ cmd_uninstall() {
   log "removed timer + service unit (config, state and binaries left intact)"
 }
 
+cmd_check() {             # read-only: report whether newer releases exist (no changes, no root)
+  resolve_target
+  echo "Checking GitHub for updates (read-only - nothing is installed)..."
+  echo
+  local curver inst lt
+  curver="$(bin_version "${BIN:-/bin/false}")"
+  inst="$(cat "$STATE_TAG" 2>/dev/null || echo '<none>')"
+  lt="$(gh_releases "$REPO" 2>/dev/null | pick_latest "$TAG_PREFIX" "$ASSET" 2>/dev/null | cut -f1 || true)"
+  if   [[ -z "$lt" ]];       then echo "nym-node   : could not reach GitHub"
+  elif [[ "$lt" == "$inst" ]]; then echo "nym-node   : up to date (${curver:-?}, $lt)"
+  else                            echo "nym-node   : UPDATE AVAILABLE -> $lt   (installed ${curver:-?}, last applied $inst)"; fi
+
+  if [[ -n "${BRIDGE_UNIT:-}" ]]; then
+    local binst blt
+    binst="$(cat "$BRIDGE_STATE_TAG" 2>/dev/null || echo '<none>')"
+    blt="$(gh_releases "$BRIDGE_REPO" 2>/dev/null | pick_latest "$BRIDGE_TAG_PREFIX" "$BRIDGE_ASSET" 2>/dev/null | cut -f1 || true)"
+    if   [[ -z "$blt" ]];        then echo "nym-bridge : could not reach GitHub"
+    elif [[ "$blt" == "$binst" ]]; then echo "nym-bridge : up to date ($blt)"
+    else                              echo "nym-bridge : UPDATE AVAILABLE -> $blt   (last applied $binst)"; fi
+  fi
+
+  if [[ "${NTM_ENABLED:-0}" == "1" && -n "$lt" ]]; then
+    local ntm_inst
+    ntm_inst="$(cat "$NTM_STATE" 2>/dev/null || echo '<none>')"
+    if   [[ "$lt" == "$ntm_inst" ]]; then echo "tunnel(NTM): already evaluated for $lt"
+    elif changelog_mentions_ntm "$lt" >/dev/null 2>&1; then echo "tunnel(NTM): $lt changelog mentions tunnel/ports -> NTM would re-apply on next run"
+    else echo "tunnel(NTM): $lt changelog has no tunnel/port changes (NTM re-applies only if a self-test fails)"; fi
+  fi
+  echo
+  echo "To apply now: sudo $DEST_PATH run"
+}
+
 cmd_status() {
   resolve_target
   echo "nym-node unit : ${UNIT:-<none found>}"
@@ -610,8 +643,9 @@ main() {
       cmd_run ;;
     install)   need_root "$@"; cmd_install ;;
     uninstall) need_root "$@"; cmd_uninstall ;;
+    check)     cmd_check ;;
     status)    cmd_status ;;
-    *) echo "usage: $0 {install|run|uninstall|status}"; exit 1 ;;
+    *) echo "usage: $0 {install|run|check|status|uninstall}"; exit 1 ;;
   esac
 }
 main "$@"
