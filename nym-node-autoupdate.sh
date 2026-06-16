@@ -356,7 +356,10 @@ changelog_mentions_ntm() {
     f && /^## \[/ {exit}
     f {print}')"
   [[ -n "$section" ]] || return 2
-  matched="$(printf '%s\n' "$section" | grep -iE 'tunnel|iptables|firewall|\bports?\b|wireguard|nymtun|forwarding|routing|exit.?polic' || true)"
+  # high-precision: explicit tunnel/firewall signals only (generic words like "port"/"forwarding"/
+  # "routing" caused false triggers, e.g. "Testing port checks in NS Agents"). The real egress probe
+  # is the primary safety net for anything this misses.
+  matched="$(printf '%s\n' "$section" | grep -iE 'network.?tunnel.?manager|nymtun|iptables|firewall|wireguard|open[^.]{0,20}\bports?\b|new[^.]{0,15}\bports?\b' || true)"
   [[ -n "$matched" ]] || return 1
   printf '%s\n' "$matched"
 }
