@@ -1,46 +1,52 @@
 #!/usr/bin/env bash
 #
 # nym-node-autoupdate.sh
-# Safe, self-contained auto-updater for a nym-node systemd service.
+# Safe, self-contained, ROLE-AWARE auto-updater for a Nym node under systemd.
+#
+# It keeps two things current, with the same safety machinery for both:
+#   * nym-node       - the one binary that runs in ANY role (mixnode / entry-gw / exit-gw).
+#                      Source: github.com/nymtech/nym  (tags nym-binaries-v*), sha256-verified.
+#   * nym-bridge     - the QUIC bridge, GATEWAYS ONLY. Updated only if nym-bridge.service exists.
+#                      Source: github.com/nymtech/nym-bridges (tags bridge-binaries-v*).
 #
 # Two phases:
-#   * INSTALL (interactive)  - you run the script once. It auto-detects the nym-node systemd
-#       unit, the user it runs as, and the binary path; shows you what it found; lets you
-#       CONFIRM or CORRECT it; saves that to /etc/nym-node-autoupdate.conf; then installs a
-#       systemd timer that does the hourly checks.
-#   * RUN (unattended)       - the timer calls "run" every hour. It reads the saved config and,
-#       if a genuinely new stable release exists, downloads it, verifies its SHA-256, swaps it
-#       in, restarts the service, and ROLLS BACK automatically if the node does not come back
-#       healthy. Between releases it does nothing.
+#   * INSTALL (interactive) - run the script once. It auto-detects the nym-node unit, the user it
+#       runs as, the binary path, the node role, and (on gateways) the nym-bridge unit/binary;
+#       shows you what it found; lets you CONFIRM or CORRECT it; saves it to
+#       /etc/nym-node-autoupdate.conf; then installs a systemd timer for the hourly checks.
+#   * RUN (unattended) - the timer calls "run" hourly. For each component, if a genuinely new
+#       stable release exists, it downloads it, verifies it, swaps the binary, restarts the
+#       service, and ROLLS BACK automatically if the service does not come back healthy.
 #
-# Safety: the binary is checksum-verified and smoke-tested before install; the only downtime is
-# the stop->copy->start window; any failure restores the previous binary; a release that fails
-# its health check is recorded and never retried. It never leaves the node down.
+# Safety: binaries are checksum-verified (when the release ships hashes) and smoke-tested before
+# install; the only downtime is the stop->copy->start window; any failure restores the previous
+# binary; a release that fails its health check is recorded and never retried. It is built so it
+# can never leave a node down.
 #
 # Subcommands:
 #   nym-node-autoupdate.sh            # same as 'install' (interactive setup)
-#   nym-node-autoupdate.sh install    # interactive: detect, confirm/correct, save config, set timer
-#   nym-node-autoupdate.sh run        # one unattended check + update (what the timer runs)
-#   nym-node-autoupdate.sh uninstall  # remove the timer (leaves config, state and binary alone)
+#   nym-node-autoupdate.sh install    # detect, confirm/correct, save config, set up the timer
+#   nym-node-autoupdate.sh run        # one unattended check + update of every component
+#   nym-node-autoupdate.sh uninstall  # remove the timer (leaves config, state and binaries alone)
 #   nym-node-autoupdate.sh status     # print detected/configured setup and last known state
 #
 set -euo pipefail
 
 # ------------------------------- configuration -------------------------------
-REPO="nymtech/nym"                          # GitHub repo that publishes nym-node
-TAG_PREFIX="nym-binaries-v"                 # only releases tagged like this carry nym-node
-ASSET="nym-node"                            # the release asset name == the binary name
+REPO="nymtech/nym";          TAG_PREFIX="nym-binaries-v";    ASSET="nym-node"
+BRIDGE_REPO="nymtech/nym-bridges"; BRIDGE_TAG_PREFIX="bridge-binaries-v"; BRIDGE_ASSET="nym-bridge"
+
 MIN_AGE_HOURS="${NYM_MIN_AGE_HOURS:-2}"     # ignore releases younger than this (anti-yank buffer)
 HEALTH_WAIT="${NYM_HEALTH_WAIT:-25}"        # seconds to wait after restart before health check
-KEEP_BACKUPS="${NYM_KEEP_BACKUPS:-3}"       # how many old binaries to keep in the backup dir
+KEEP_BACKUPS="${NYM_KEEP_BACKUPS:-3}"       # how many old binaries to keep, per component
 
 CONFIG_FILE="/etc/nym-node-autoupdate.conf" # written by install, read on every run
 STATE_DIR="/var/lib/nym-autoupdate"
 LOGFILE="/var/log/nym-autoupdate.log"
 LOCKFILE="/run/nym-autoupdate.lock"
 BACKUP_DIR="$STATE_DIR/backups"
-STATE_TAG="$STATE_DIR/last_tag"             # last release tag we successfully installed
-FAILED_TAGS="$STATE_DIR/failed_tags"        # releases that failed health check (never retried)
+STATE_TAG="$STATE_DIR/last_tag";               FAILED_TAGS="$STATE_DIR/failed_tags"
+BRIDGE_STATE_TAG="$STATE_DIR/bridge_last_tag"; BRIDGE_FAILED_TAGS="$STATE_DIR/bridge_failed_tags"
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
@@ -60,250 +66,281 @@ notify() { :; }
 
 ensure_dirs() {
   mkdir -p "$STATE_DIR" "$BACKUP_DIR"
-  touch "$FAILED_TAGS" 2>/dev/null || true
+  touch "$FAILED_TAGS" "$BRIDGE_FAILED_TAGS" 2>/dev/null || true
 }
 
-# Re-run ourselves under sudo when we are not root (install/run/uninstall need root to replace
-# the binary and manage systemd). Operators who are not root just get a sudo password prompt.
+# Re-run under sudo when not root (install/run/uninstall must replace binaries + manage systemd).
 need_root() {
   if [[ "$(id -u)" -eq 0 ]]; then return 0; fi
   if command -v sudo >/dev/null 2>&1; then
     echo "not root; re-running via sudo..."
     exec sudo -E -- "$SELF_PATH" "$@"
   fi
-  die "this needs root (it replaces the binary and manages systemd). Re-run as root or install sudo."
+  die "this needs root (replaces binaries and manages systemd). Re-run as root or install sudo."
 }
 
 # ------------------------------- autodetection ------------------------------
 detect_unit() {
   systemctl list-units --all --type=service --no-legend 2>/dev/null \
-    | awk '{print $1}' \
-    | grep -E '^nym-node(@[^.]*)?\.service$' \
-    | head -n1 || true
+    | awk '{print $1}' | grep -E '^nym-node(@[^.]*)?\.service$' | head -n1 || true
 }
-
-detect_bin() {
+detect_bridge_unit() {
+  systemctl list-units --all --type=service --no-legend 2>/dev/null \
+    | awk '{print $1}' | grep -E '^nym-bridge(@[^.]*)?\.service$' | head -n1 || true
+}
+detect_bin() {            # binary path for the given unit (absolute from ExecStart, else via PATH)
   local unit="${1:-}" p
   p="$(systemctl show -p ExecStart --value "$unit" 2>/dev/null | grep -oP 'path=\K\S+' | head -n1 || true)"
-  if [[ "$p" == /* && -x "$p" ]]; then
-    printf '%s\n' "$p"; return 0
-  fi
-  # ExecStart used a bare name resolved via PATH (e.g. templated units) -> resolve it.
+  if [[ "$p" == /* && -x "$p" ]]; then printf '%s\n' "$p"; return 0; fi
   command -v nym-node 2>/dev/null || true
 }
-
+detect_bridge_bin() {
+  local unit="${1:-}" p
+  p="$(systemctl show -p ExecStart --value "$unit" 2>/dev/null | grep -oP 'path=\K\S+' | head -n1 || true)"
+  if [[ "$p" == /* && -x "$p" ]]; then printf '%s\n' "$p"; return 0; fi
+  command -v nym-bridge 2>/dev/null || true
+}
 detect_user() {
   local unit="${1:-}" u
   u="$(systemctl show -p User --value "$unit" 2>/dev/null || true)"
   printf '%s\n' "${u:-root}"
 }
-
-bin_version() {
+detect_role() {           # best-effort label for display/logging
+  local unit="${1:-}" es
+  if [[ -n "$(detect_bridge_unit)" ]]; then echo "gateway (has QUIC bridge)"; return; fi
+  es="$(systemctl show -p ExecStart --value "$unit" 2>/dev/null || true)"
+  case "$es" in
+    *exit-gateway*|*entry-gateway*) echo "gateway" ;;
+    *mixnode*)                      echo "mixnode" ;;
+    *)                              echo "node (role set in config [modes])" ;;
+  esac
+}
+bin_version() {           # extract "Build Version: X.Y.Z" from a nym binary; empty if none
   "$1" --version 2>/dev/null | grep -ioP 'build version:\s*\K[0-9][0-9.]*' | head -n1 || true
 }
 
-# Resolve unit/bin/user from the saved config first, falling back to live detection.
+# Resolve everything from the saved config first, falling back to live detection.
 resolve_target() {
-  UNIT=""; BIN=""; SVC_USER=""
+  UNIT=""; BIN=""; SVC_USER=""; ROLE=""; BRIDGE_UNIT=""; BRIDGE_BIN=""
   if [[ -f "$CONFIG_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$CONFIG_FILE" || true
   fi
-  [[ -n "${UNIT:-}" ]]     || UNIT="$(detect_unit)"
-  [[ -n "${BIN:-}" ]]      || BIN="$(detect_bin "$UNIT")"
-  [[ -n "${SVC_USER:-}" ]] || SVC_USER="$(detect_user "$UNIT")"
+  [[ -n "${UNIT:-}" ]]        || UNIT="$(detect_unit)"
+  [[ -n "${BIN:-}" ]]         || BIN="$(detect_bin "$UNIT")"
+  [[ -n "${SVC_USER:-}" ]]    || SVC_USER="$(detect_user "$UNIT")"
+  [[ -n "${BRIDGE_UNIT:-}" ]] || BRIDGE_UNIT="$(detect_bridge_unit)"
+  if [[ -n "${BRIDGE_UNIT:-}" && -z "${BRIDGE_BIN:-}" ]]; then BRIDGE_BIN="$(detect_bridge_bin "$BRIDGE_UNIT")"; fi
+  [[ -n "${ROLE:-}" ]]        || ROLE="$(detect_role "$UNIT")"
 }
 
 save_config() {
   cat > "$CONFIG_FILE" <<EOF
 # nym-node-autoupdate config - written by 'install', read on every run.
 # Edit by hand if your setup changes, or re-run: $DEST_PATH install
+# Leave BRIDGE_UNIT empty to disable QUIC-bridge updates.
 UNIT="$1"
 BIN="$2"
 SVC_USER="$3"
+ROLE="$4"
+BRIDGE_UNIT="$5"
+BRIDGE_BIN="$6"
 EOF
   chmod 0644 "$CONFIG_FILE"
 }
 
 # ------------------------------- github lookup ------------------------------
-gh_releases() {
+gh_releases() {           # arg: owner/repo
   curl -fsSL --retry 3 --retry-delay 5 --max-time 45 \
-       -H "Accept: application/vnd.github+json" \
-       -H "X-GitHub-Api-Version: 2022-11-28" \
-       "https://api.github.com/repos/$REPO/releases?per_page=30"
+       -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+       "https://api.github.com/repos/$1/releases?per_page=30"
 }
-
-# From the releases JSON on stdin, emit "tag<TAB>published<TAB>node_url<TAB>hash_url"
-# for the newest stable nym-binaries release that has a nym-node asset.
+# From releases JSON on stdin, emit "tag<TAB>published<TAB>asset_url<TAB>hashes_url"
+# for the newest stable release (tag startswith prefix) that carries the asset. args: prefix asset
 pick_latest() {
-  jq -r --arg pref "$TAG_PREFIX" --arg asset "$ASSET" '
+  jq -r --arg pref "$1" --arg asset "$2" '
     [ .[]
       | select(.draft==false and .prerelease==false)
       | select(.tag_name | startswith($pref))
       | select(any(.assets[]?; .name==$asset))
     ]
     | sort_by(.published_at) | reverse | .[0] // empty
-    | [ .tag_name,
-        .published_at,
+    | [ .tag_name, .published_at,
         (.assets[] | select(.name==$asset)        | .browser_download_url),
-        ((.assets[] | select(.name=="hashes.json") | .browser_download_url) // "")
-      ] | @tsv
+        ((.assets[] | select(.name=="hashes.json") | .browser_download_url) // "") ] | @tsv
   '
 }
+age_hours() { local pub now; pub="$(date -u -d "$1" +%s 2>/dev/null)" || return 1; now="$(date -u +%s)"; printf '%s\n' "$(( (now - pub) / 3600 ))"; }
 
-age_hours() { # arg: ISO8601 date -> integer hours since then
-  local pub now
-  pub="$(date -u -d "$1" +%s 2>/dev/null)" || return 1
-  now="$(date -u +%s)"
-  printf '%s\n' "$(( (now - pub) / 3600 ))"
+# ----------------------- the generic component updater ----------------------
+# update_component <name> <repo> <tagprefix> <asset> <bin> <unit> <statefile> <failedfile> <smoke>
+#   smoke = "version" (nym-node: must report a build version) | "runs" (nym-bridge: --help must work)
+# Returns: 0 = updated or nothing-to-do; 1 = aborted/rolled-back (service still up); 2 = critical.
+update_component() {
+  local NAME="$1" CREPO="$2" CPREF="$3" CASSET="$4" CBIN="$5" CUNIT="$6" CSTATE="$7" CFAILED="$8" SMODE="$9"
+  local curver=""
+  [[ "$SMODE" == "version" ]] && curver="$(bin_version "$CBIN")"
+
+  local rels latest tag published url hashurl
+  rels="$(gh_releases "$CREPO")"               || { log "[$NAME] github query failed; skip this cycle"; return 0; }
+  latest="$(printf '%s' "$rels" | pick_latest "$CPREF" "$CASSET")" || { log "[$NAME] could not parse releases; skip"; return 0; }
+  [[ -n "$latest" ]]                           || { log "[$NAME] no qualifying release found; skip"; return 0; }
+  IFS=$'\t' read -r tag published url hashurl <<<"$latest" || true
+  [[ -n "$tag" && -n "$url" ]]                  || { log "[$NAME] incomplete release metadata; skip"; return 0; }
+
+  local last; last="$(cat "$CSTATE" 2>/dev/null || true)"
+  [[ "$tag" != "$last" ]]                        || { log "[$NAME] already on latest ($tag); nothing to do"; return 0; }
+  if grep -qxF "$tag" "$CFAILED" 2>/dev/null; then log "[$NAME] $tag previously failed here; skipping (clear $CFAILED to retry)"; return 0; fi
+
+  local age; age="$(age_hours "$published")" || age=9999
+  if (( age < MIN_AGE_HOURS )); then log "[$NAME] newest $tag only ${age}h old (< ${MIN_AGE_HOURS}h); waiting"; return 0; fi
+  log "[$NAME] new release available: $tag (published $published, ~${age}h ago)"
+
+  local tmp rc=0; tmp="$(mktemp -d /tmp/nym-autoupdate.XXXXXX)"
+  while :; do
+    if ! curl -fsSL --retry 3 --retry-delay 5 --max-time 300 -o "$tmp/bin" "$url"; then
+      log "[$NAME] download failed; skip"; rc=0; break
+    fi
+
+    local want=""
+    if [[ -n "$hashurl" ]] && curl -fsSL --retry 3 --max-time 60 -o "$tmp/hashes.json" "$hashurl"; then
+      want="$(jq -r --arg a "$CASSET" '.assets[$a].sha256 // empty' "$tmp/hashes.json" 2>/dev/null || true)"
+    fi
+    if [[ -n "$want" ]]; then
+      local got; got="$(sha256sum "$tmp/bin" | awk '{print $1}')"
+      if [[ "$got" != "$want" ]]; then log "[$NAME] SHA-256 mismatch for $tag (want $want got $got) - NOT installing"; rc=1; break; fi
+      log "[$NAME] sha256 verified ok"
+    else
+      log "[$NAME] WARNING: no published checksum for $tag; proceeding without sha256 verification"
+    fi
+
+    chmod +x "$tmp/bin"
+    local newver=""
+    if [[ "$SMODE" == "version" ]]; then
+      newver="$(bin_version "$tmp/bin")"
+      if [[ -z "$newver" ]]; then log "[$NAME] downloaded binary fails --version; NOT installing"; rc=1; break; fi
+      log "[$NAME] downloaded build version $newver ($tag)"
+      if [[ -n "$curver" && "$newver" == "$curver" ]]; then
+        log "[$NAME] binary version unchanged ($curver); recording tag, no restart"; printf '%s\n' "$tag" > "$CSTATE"; rc=0; break
+      fi
+    else
+      if ! "$tmp/bin" --help >/dev/null 2>&1; then log "[$NAME] downloaded binary does not execute (--help failed); NOT installing"; rc=1; break; fi
+      log "[$NAME] downloaded new binary ($tag); smoke test ok"
+    fi
+
+    # backup (preserve owner/mode) -> stop -> install -> start
+    local owner mode stamp backup
+    owner="$(stat -c '%U:%G' "$CBIN" 2>/dev/null || echo root:root)"
+    mode="$(stat -c '%a' "$CBIN" 2>/dev/null || echo 755)"
+    stamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+    backup="$BACKUP_DIR/${NAME}.${curver:-prev}.$stamp"
+    if ! cp -a "$CBIN" "$backup"; then log "[$NAME] backup failed; aborting (no change made)"; rc=1; break; fi
+    log "[$NAME] backed up -> $backup (owner=$owner mode=$mode)"
+
+    log "[$NAME] stopping $CUNIT"
+    systemctl stop "$CUNIT" || log "[$NAME] warning: stop returned non-zero"
+    if ! install -m "$mode" -o "${owner%:*}" -g "${owner#*:}" "$tmp/bin" "$CBIN"; then
+      log "[$NAME] install failed; restoring backup"; cp -a "$backup" "$CBIN"; systemctl start "$CUNIT" || true; rc=1; break
+    fi
+    log "[$NAME] installed new binary; starting $CUNIT"
+    systemctl start "$CUNIT" || log "[$NAME] warning: start returned non-zero"
+
+    # health: active + running + PID stable over a 2nd window (+ version match if known)
+    local pid1 pid2 active substate runver healthy=1
+    sleep "$HEALTH_WAIT"
+    pid1="$(systemctl show -p ExecMainPID --value "$CUNIT" 2>/dev/null || echo 0)"
+    sleep 8
+    pid2="$(systemctl show -p ExecMainPID --value "$CUNIT" 2>/dev/null || echo 0)"
+    active="$(systemctl is-active "$CUNIT" 2>/dev/null || true)"
+    substate="$(systemctl show -p SubState --value "$CUNIT" 2>/dev/null || true)"
+    [[ "$active" == "active" ]]    || healthy=0
+    [[ "$substate" == "running" ]] || healthy=0
+    [[ "$pid1" != "0" && "$pid1" == "$pid2" ]] || healthy=0
+    if [[ -n "$newver" ]]; then runver="$(bin_version "$CBIN")"; [[ "$runver" == "$newver" ]] || healthy=0; fi
+
+    if (( healthy == 1 )); then
+      printf '%s\n' "$tag" > "$CSTATE"
+      log "[$NAME] SUCCESS: $CUNIT healthy on ${newver:-$tag} [active=$active sub=$substate pid=$pid1]"
+      notify success "$NAME updated to ${newver:-$tag} and healthy"
+      ls -1t "$BACKUP_DIR/${NAME}."* 2>/dev/null | tail -n +$((KEEP_BACKUPS+1)) | xargs -r rm -f
+      rc=0; break
+    fi
+
+    # rollback
+    log "[$NAME] HEALTH CHECK FAILED [active=$active sub=$substate pid=$pid1/$pid2]; ROLLING BACK"
+    systemctl stop "$CUNIT" || true
+    cp -a "$backup" "$CBIN"
+    systemctl start "$CUNIT" || true
+    sleep "$HEALTH_WAIT"
+    printf '%s\n' "$tag" >> "$CFAILED"
+    local active2; active2="$(systemctl is-active "$CUNIT" 2>/dev/null || true)"
+    if [[ "$active2" == "active" ]]; then
+      log "[$NAME] ROLLBACK OK: restored previous binary, $CUNIT active again. $tag marked failed (won't retry)."
+      notify rollback "$NAME update to $tag FAILED; rolled back, $CUNIT is UP"; rc=1; break
+    fi
+    log "[$NAME] CRITICAL: rollback did NOT restore $CUNIT. MANUAL INTERVENTION NEEDED."
+    notify failed "CRITICAL: $NAME update to $tag failed AND rollback failed on $CUNIT"; rc=2; break
+  done
+  rm -rf "$tmp"
+  return "$rc"
 }
 
-expected_sha() { jq -r --arg a "$ASSET" '.assets[$a].sha256 // empty' "$1"; }
-
-# --------------------------------- the work ---------------------------------
+# --------------------------------- run --------------------------------------
 cmd_run() {
   ensure_dirs
   resolve_target
-  local unit="$UNIT" bin="$BIN" svcuser="$SVC_USER" curver
-  [[ -n "$unit" ]]               || die "no nym-node systemd service found (run 'install' first)"
-  systemctl cat "$unit" >/dev/null 2>&1 || die "configured unit '$unit' not known to systemd"
-  [[ -n "$bin" && -x "$bin" ]]   || die "could not locate the nym-node binary ('$bin')"
-  curver="$(bin_version "$bin")"
-  log "target: unit=$unit user=$svcuser bin=$bin current_version=${curver:-unknown}"
+  [[ -n "$UNIT" ]]                       || die "no nym-node systemd service found (run 'install' first)"
+  systemctl cat "$UNIT" >/dev/null 2>&1  || die "configured unit '$UNIT' not known to systemd"
+  [[ -n "$BIN" && -x "$BIN" ]]           || die "could not locate the nym-node binary ('$BIN')"
+  log "target: unit=$UNIT user=$SVC_USER bin=$BIN role=$ROLE"
 
-  # --- find the newest stable release ---
-  local rels latest tag published node_url hash_url
-  rels="$(gh_releases)"            || { log "github query failed; will retry next run"; exit 0; }
-  latest="$(printf '%s' "$rels" | pick_latest)" || { log "could not parse releases; skip"; exit 0; }
-  [[ -n "$latest" ]]              || { log "no qualifying nym-binaries release found; skip"; exit 0; }
-  IFS=$'\t' read -r tag published node_url hash_url <<<"$latest" || true
-  [[ -n "$tag" && -n "$node_url" ]] || { log "incomplete release metadata; skip"; exit 0; }
+  local node_rc=0 bridge_rc=0
+  update_component "nym-node" "$REPO" "$TAG_PREFIX" "$ASSET" \
+                   "$BIN" "$UNIT" "$STATE_TAG" "$FAILED_TAGS" "version" || node_rc=$?
 
-  local last; last="$(cat "$STATE_TAG" 2>/dev/null || true)"
-  if [[ "$tag" == "$last" ]]; then
-    log "already on latest release ($tag); nothing to do"; exit 0
-  fi
-  if grep -qxF "$tag" "$FAILED_TAGS" 2>/dev/null; then
-    log "release $tag already failed health check here; skipping (clear $FAILED_TAGS to retry)"; exit 0
+  if [[ -n "${BRIDGE_UNIT:-}" ]] && systemctl cat "$BRIDGE_UNIT" >/dev/null 2>&1 \
+        && [[ -n "${BRIDGE_BIN:-}" && -x "${BRIDGE_BIN:-}" ]]; then
+    log "gateway: also checking QUIC bridge ($BRIDGE_UNIT)"
+    update_component "nym-bridge" "$BRIDGE_REPO" "$BRIDGE_TAG_PREFIX" "$BRIDGE_ASSET" \
+                     "$BRIDGE_BIN" "$BRIDGE_UNIT" "$BRIDGE_STATE_TAG" "$BRIDGE_FAILED_TAGS" "runs" || bridge_rc=$?
   fi
 
-  local age; age="$(age_hours "$published")" || age=9999
-  if (( age < MIN_AGE_HOURS )); then
-    log "newest release $tag is only ${age}h old (< ${MIN_AGE_HOURS}h); waiting before adopting"; exit 0
-  fi
-  log "new release available: $tag (published $published, ~${age}h ago)"
-
-  # --- download + verify (nothing on the node is touched yet) ---
-  local tmp; tmp="$(mktemp -d /tmp/nym-autoupdate.XXXXXX)"
-  trap 'rm -rf "$tmp"' EXIT
-  curl -fsSL --retry 3 --retry-delay 5 --max-time 300 -o "$tmp/nym-node" "$node_url" \
-    || { log "download of nym-node failed; skip"; exit 0; }
-
-  local want=""
-  if [[ -n "$hash_url" ]] && curl -fsSL --retry 3 --max-time 60 -o "$tmp/hashes.json" "$hash_url"; then
-    want="$(expected_sha "$tmp/hashes.json")"
-  fi
-  if [[ -n "$want" ]]; then
-    local got; got="$(sha256sum "$tmp/nym-node" | awk '{print $1}')"
-    [[ "$got" == "$want" ]] || die "SHA-256 mismatch for $tag (want $want got $got) - NOT installing"
-    log "sha256 verified ok"
-  else
-    log "WARNING: no published hash for $tag; proceeding without checksum verification"
-  fi
-
-  chmod +x "$tmp/nym-node"
-  local newver; newver="$(bin_version "$tmp/nym-node")"
-  [[ -n "$newver" ]] || die "downloaded binary does not run (--version failed) - NOT installing"
-  log "downloaded nym-node build version $newver (release $tag)"
-
-  if [[ -n "$curver" && "$newver" == "$curver" ]]; then
-    log "binary version unchanged ($curver); recording tag, no restart needed"
-    printf '%s\n' "$tag" > "$STATE_TAG"; exit 0
-  fi
-
-  # --- backup, swap (preserving the old binary's owner/mode), restart ---
-  local stamp backup owner mode pid1 pid2 active substate runver
-  owner="$(stat -c '%U:%G' "$bin" 2>/dev/null || echo root:root)"
-  mode="$(stat -c '%a' "$bin" 2>/dev/null || echo 755)"
-  stamp="$(date -u '+%Y%m%dT%H%M%SZ')"
-  backup="$BACKUP_DIR/nym-node.${curver:-unknown}.$stamp"
-  cp -a "$bin" "$backup" || die "backup failed; aborting before any change"
-  log "backed up current binary -> $backup (owner=$owner mode=$mode)"
-
-  log "stopping $unit"
-  systemctl stop "$unit" || log "warning: stop returned non-zero"
-  if ! install -m "$mode" -o "${owner%:*}" -g "${owner#*:}" "$tmp/nym-node" "$bin"; then
-    log "install of new binary failed; restoring backup"
-    cp -a "$backup" "$bin"; systemctl start "$unit" || true
-    die "install failed; rolled back to previous binary"
-  fi
-  log "installed new binary; starting $unit"
-  systemctl start "$unit" || log "warning: start returned non-zero"
-
-  # --- health check: active + running + correct version + PID stable over a 2nd window ---
-  sleep "$HEALTH_WAIT"
-  pid1="$(systemctl show -p ExecMainPID --value "$unit" 2>/dev/null || echo 0)"
-  sleep 8
-  pid2="$(systemctl show -p ExecMainPID --value "$unit" 2>/dev/null || echo 0)"
-  active="$(systemctl is-active "$unit" 2>/dev/null || true)"
-  substate="$(systemctl show -p SubState --value "$unit" 2>/dev/null || true)"
-  runver="$(bin_version "$bin")"
-
-  local healthy=1
-  [[ "$active" == "active" ]]    || healthy=0
-  [[ "$substate" == "running" ]] || healthy=0
-  [[ "$runver" == "$newver" ]]   || healthy=0
-  [[ "$pid1" != "0" && "$pid1" == "$pid2" ]] || healthy=0
-
-  if (( healthy == 1 )); then
-    printf '%s\n' "$tag" > "$STATE_TAG"
-    log "SUCCESS: $unit healthy on $newver ($tag) [active=$active sub=$substate pid=$pid1]"
-    notify success "nym-node updated to $newver ($tag) and healthy"
-    ls -1t "$BACKUP_DIR"/nym-node.* 2>/dev/null | tail -n +$((KEEP_BACKUPS+1)) | xargs -r rm -f
-    exit 0
-  fi
-
-  # --- rollback ---
-  log "HEALTH CHECK FAILED [active=$active sub=$substate runver=$runver pid=$pid1/$pid2]; ROLLING BACK"
-  systemctl stop "$unit" || true
-  cp -a "$backup" "$bin"
-  systemctl start "$unit" || true
-  sleep "$HEALTH_WAIT"
-  printf '%s\n' "$tag" >> "$FAILED_TAGS"
-  local active2; active2="$(systemctl is-active "$unit" 2>/dev/null || true)"
-  if [[ "$active2" == "active" ]]; then
-    log "ROLLBACK OK: restored ${curver:-previous} binary, $unit active again. $tag marked failed (won't retry)."
-    notify rollback "nym-node update to $tag FAILED; rolled back to ${curver:-previous}, node is UP"
-    exit 1
-  fi
-  log "CRITICAL: rollback did NOT bring $unit back. MANUAL INTERVENTION NEEDED."
-  notify failed "CRITICAL: nym-node update to $tag failed AND rollback failed on $unit"
-  exit 2
+  log "run complete (nym-node rc=$node_rc, nym-bridge rc=$bridge_rc)"
+  if (( node_rc != 0 || bridge_rc != 0 )); then exit 1; fi
+  exit 0
 }
 
 # ------------------------------ install/remove ------------------------------
 cmd_install() {
   ensure_dirs
-  local unit bin svcuser curver
-  unit="$(detect_unit)"
-  bin="$(detect_bin "$unit")"
-  svcuser="$(detect_user "$unit")"
-  curver="$(bin_version "${bin:-/bin/false}")"
+  local unit bin svcuser role brunit brbin brver curver
+  unit="$(detect_unit)"; bin="$(detect_bin "$unit")"; svcuser="$(detect_user "$unit")"
+  role="$(detect_role "$unit")"; curver="$(bin_version "${bin:-/bin/false}")"
+  brunit="$(detect_bridge_unit)"; brbin=""; brver=""
+  if [[ -n "$brunit" ]]; then brbin="$(detect_bridge_bin "$brunit")"; brver="$(dpkg-query -W -f='${Version}' nym-bridge 2>/dev/null || true)"; fi
 
-  echo "Detected nym-node setup on $(hostname):"
-  echo "  service unit : ${unit:-<NOT FOUND>}"
-  echo "  runs as user : ${svcuser:-root}"
-  echo "  binary       : ${bin:-<NOT FOUND>}"
-  echo "  version      : ${curver:-<unknown>}"
+  echo "Detected on $(hostname):"
+  echo "  nym-node unit : ${unit:-<NOT FOUND>}"
+  echo "  runs as user  : ${svcuser:-root}"
+  echo "  nym-node bin  : ${bin:-<NOT FOUND>}"
+  echo "  version       : ${curver:-<unknown>}"
+  echo "  role          : ${role}"
+  if [[ -n "$brunit" ]]; then
+    echo "  QUIC bridge   : ${brunit}  bin=${brbin:-<?>}  ver=${brver:-<?>}   -> WILL be auto-updated"
+  else
+    echo "  QUIC bridge   : none (mixnode / no bridge)   -> bridge updates skipped"
+  fi
   echo
 
   if [[ "${NYM_ASSUME_YES:-0}" != "1" && -t 0 ]]; then
     local ans a
     read -rp "Use this? [Y = yes / n = let me correct it]: " ans
     if [[ "${ans:-}" =~ ^[nN] ]]; then
-      read -rp "  systemd unit  [${unit}]: " a;    unit="${a:-$unit}"
-      read -rp "  binary path   [${bin}]: " a;     bin="${a:-$bin}"
-      read -rp "  service user  [${svcuser}]: " a; svcuser="${a:-$svcuser}"
+      read -rp "  nym-node unit   [${unit}]: " a;    unit="${a:-$unit}"
+      read -rp "  nym-node bin    [${bin}]: " a;     bin="${a:-$bin}"
+      read -rp "  service user    [${svcuser}]: " a; svcuser="${a:-$svcuser}"
+      read -rp "  bridge unit (blank=none) [${brunit}]: " a; brunit="${a-$brunit}"
+      if [[ -n "$brunit" ]]; then read -rp "  bridge bin    [${brbin}]: " a; brbin="${a:-$brbin}"; else brbin=""; fi
     fi
   else
     log "non-interactive install; using detected values"
@@ -312,15 +349,19 @@ cmd_install() {
   # validate before committing anything
   [[ -n "$unit" ]] || die "no systemd unit set; aborting"
   systemctl cat "$unit" >/dev/null 2>&1 || die "unit '$unit' not found by systemd; aborting"
-  [[ -n "$bin" && -x "$bin" ]] || die "binary '$bin' missing or not executable; aborting"
+  [[ -n "$bin" && -x "$bin" ]] || die "nym-node binary '$bin' missing or not executable; aborting"
+  if [[ -n "$brunit" ]]; then
+    systemctl cat "$brunit" >/dev/null 2>&1 || die "bridge unit '$brunit' not found by systemd; aborting"
+    [[ -n "$brbin" && -x "$brbin" ]] || die "bridge binary '$brbin' missing or not executable; aborting"
+  fi
 
-  save_config "$unit" "$bin" "${svcuser:-root}"
-  log "saved config -> $CONFIG_FILE (unit=$unit bin=$bin user=${svcuser:-root})"
+  save_config "$unit" "$bin" "${svcuser:-root}" "$role" "$brunit" "$brbin"
+  log "saved config -> $CONFIG_FILE (unit=$unit bin=$bin user=${svcuser:-root} bridge=${brunit:-none})"
 
   install -m 0755 "$SELF_PATH" "$DEST_PATH"
   cat > /etc/systemd/system/nym-node-autoupdate.service <<UNIT
 [Unit]
-Description=nym-node auto-updater (check GitHub, update if a new stable release exists)
+Description=nym-node auto-updater (check GitHub, update nym-node + QUIC bridge if new stable releases exist)
 After=network-online.target
 Wants=network-online.target
 
@@ -345,7 +386,7 @@ UNIT
   log "installed + enabled systemd timer (hourly, up to 20min jitter, catches missed runs after downtime)"
   systemctl list-timers nym-node-autoupdate.timer --no-pager 2>/dev/null || true
   echo
-  echo "Done. It will check hourly and update only when a new stable nym-node release appears."
+  echo "Done. It checks hourly and updates only when a new stable release appears."
   echo "Re-run '$DEST_PATH install' to change settings, or edit $CONFIG_FILE."
 
   if [[ "${NYM_ASSUME_YES:-0}" != "1" && -t 0 ]]; then
@@ -359,23 +400,31 @@ cmd_uninstall() {
   systemctl disable --now nym-node-autoupdate.timer 2>/dev/null || true
   rm -f /etc/systemd/system/nym-node-autoupdate.timer /etc/systemd/system/nym-node-autoupdate.service
   systemctl daemon-reload || true
-  log "removed timer + service unit (config $CONFIG_FILE, state $STATE_DIR and nym-node binary left intact)"
+  log "removed timer + service unit (config, state and binaries left intact)"
 }
 
 cmd_status() {
   resolve_target
-  echo "unit:      ${UNIT:-<none found>}"
-  echo "user:      ${SVC_USER:-root}"
-  echo "binary:    ${BIN:-<none found>}"
-  echo "version:   $(bin_version "${BIN:-/bin/false}")"
-  echo "active:    $(systemctl is-active "${UNIT:-nonexistent.service}" 2>/dev/null || true)"
-  echo "config:    $( [[ -f "$CONFIG_FILE" ]] && echo "$CONFIG_FILE" || echo '<none - using live detection>')"
-  echo "last_tag:  $(cat "$STATE_TAG" 2>/dev/null || echo '<none>')"
-  echo "failed:    $(tr '\n' ' ' < "$FAILED_TAGS" 2>/dev/null || true)"
-  if [[ -f /etc/systemd/system/nym-node-autoupdate.timer ]]; then
-    systemctl list-timers nym-node-autoupdate.timer --no-pager 2>/dev/null || echo "timer:     installed"
+  echo "nym-node unit : ${UNIT:-<none found>}"
+  echo "user          : ${SVC_USER:-root}"
+  echo "nym-node bin  : ${BIN:-<none found>}"
+  echo "version       : $(bin_version "${BIN:-/bin/false}")"
+  echo "role          : ${ROLE:-<unknown>}"
+  echo "active         : $(systemctl is-active "${UNIT:-nonexistent.service}" 2>/dev/null || true)"
+  echo "node last_tag : $(cat "$STATE_TAG" 2>/dev/null || echo '<none>')"
+  echo "node failed   : $(tr '\n' ' ' < "$FAILED_TAGS" 2>/dev/null || true)"
+  if [[ -n "${BRIDGE_UNIT:-}" ]]; then
+    echo "bridge unit   : ${BRIDGE_UNIT}  bin=${BRIDGE_BIN:-<?>}  active=$(systemctl is-active "$BRIDGE_UNIT" 2>/dev/null || true)"
+    echo "bridge last   : $(cat "$BRIDGE_STATE_TAG" 2>/dev/null || echo '<none>')"
+    echo "bridge failed : $(tr '\n' ' ' < "$BRIDGE_FAILED_TAGS" 2>/dev/null || true)"
   else
-    echo "timer:     not installed"
+    echo "bridge        : none (updates skipped)"
+  fi
+  echo "config        : $( [[ -f "$CONFIG_FILE" ]] && echo "$CONFIG_FILE" || echo '<none - live detection>')"
+  if [[ -f /etc/systemd/system/nym-node-autoupdate.timer ]]; then
+    systemctl list-timers nym-node-autoupdate.timer --no-pager 2>/dev/null || echo "timer: installed"
+  else
+    echo "timer         : not installed"
   fi
 }
 
@@ -383,12 +432,7 @@ cmd_status() {
 main() {
   local cmd="${1:-install}"
   case "$cmd" in
-    run)
-      need_root "$@"
-      exec 9>"$LOCKFILE"
-      flock -n 9 || { echo "another nym-autoupdate run is in progress; exiting"; exit 0; }
-      cmd_run
-      ;;
+    run)       need_root "$@"; exec 9>"$LOCKFILE"; flock -n 9 || { echo "another run in progress; exiting"; exit 0; }; cmd_run ;;
     install)   need_root "$@"; cmd_install ;;
     uninstall) need_root "$@"; cmd_uninstall ;;
     status)    cmd_status ;;

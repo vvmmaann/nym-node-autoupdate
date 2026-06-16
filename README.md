@@ -1,11 +1,24 @@
 # nym-node-autoupdate
 
-A small, self-contained, **safe** auto-updater for a `nym-node` running under systemd.
+A small, self-contained, **safe**, role-aware auto-updater for a Nym node under systemd.
 
-It fires on a schedule (a systemd timer, hourly by default), checks GitHub for the newest
-stable `nym-node` release, and if there is one: downloads it, verifies its checksum, swaps it
-in, restarts the service, and **rolls back automatically if the node does not come back healthy**.
-Between releases it does nothing. It is designed to never leave a node down.
+It fires on a schedule (a systemd timer, hourly by default) and keeps the node current. For each
+component, if a new stable release exists it downloads it, verifies it, swaps the binary, restarts
+the service, and **rolls back automatically if the service does not come back healthy**. Between
+releases it does nothing. It is designed to never leave a node down.
+
+## What it updates
+
+- **`nym-node`** - the single binary that runs in any role (mixnode / entry-gateway / exit-gateway).
+  Updating it covers every role; there is no separate "gateway binary". Source:
+  `github.com/nymtech/nym` (tags `nym-binaries-v*`), SHA-256 verified against the release `hashes.json`.
+- **`nym-bridge`** (the Nym QUIC Bridge) - **gateways only**. It is a separate component with its own
+  release line, so the script updates it too, but only when `nym-bridge.service` is present on the host.
+  Source: `github.com/nymtech/nym-bridges` (tags `bridge-binaries-v*`). Those releases ship no checksum
+  file, so the bridge binary is verified by HTTPS + a smoke test rather than SHA-256, and swapped with
+  the same backup/rollback machinery as `nym-node`. A mixnode has no bridge, so this step is skipped.
+
+The script detects the node's role automatically; you do not configure it per role.
 
 ## Why it is safe
 
