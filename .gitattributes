@@ -1,0 +1,4 @@
+# Force LF line endings everywhere so these scripts run on Linux regardless of
+# the OS they were authored on (this repo is edited from Windows).
+* text=auto eol=lf
+*.sh text eol=lf
