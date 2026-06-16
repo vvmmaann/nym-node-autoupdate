@@ -267,6 +267,13 @@ update_component() {
       log "[$NAME] downloaded new binary ($tag); smoke test ok"
     fi
 
+    # nothing to do if the new binary is byte-identical to the installed one
+    # (covers same-version re-releases, and the bridge which has no version string to compare)
+    if cmp -s "$tmp/bin" "$CBIN"; then
+      log "[$NAME] $tag is byte-identical to the installed binary; recording tag, no restart"
+      printf '%s\n' "$tag" > "$CSTATE"; rc=0; break
+    fi
+
     # backup (preserve owner/mode) -> stop -> install -> start
     local owner mode stamp backup
     owner="$(stat -c '%U:%G' "$CBIN" 2>/dev/null || echo root:root)"
