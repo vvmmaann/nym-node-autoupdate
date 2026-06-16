@@ -35,6 +35,7 @@ set -euo pipefail
 # ------------------------------- configuration -------------------------------
 REPO="nymtech/nym";          TAG_PREFIX="nym-binaries-v";    ASSET="nym-node"
 BRIDGE_REPO="nymtech/nym-bridges"; BRIDGE_TAG_PREFIX="bridge-binaries-v"; BRIDGE_ASSET="nym-bridge"
+NTM_REPO_PATH="scripts/nym-node-setup/network-tunnel-manager.sh"  # tunnel manager, fetched tag-pinned from $REPO
 
 MIN_AGE_HOURS="${NYM_MIN_AGE_HOURS:-2}"     # ignore releases younger than this (soak delay)
 HEALTH_WAIT="${NYM_HEALTH_WAIT:-25}"        # seconds to wait after restart before health check
@@ -51,6 +52,7 @@ LOCKFILE="/run/nym-autoupdate.lock"
 BACKUP_DIR="$STATE_DIR/backups"
 STATE_TAG="$STATE_DIR/last_tag";               FAILED_TAGS="$STATE_DIR/failed_tags"
 BRIDGE_STATE_TAG="$STATE_DIR/bridge_last_tag"; BRIDGE_FAILED_TAGS="$STATE_DIR/bridge_failed_tags"
+NTM_STATE="$STATE_DIR/ntm_last_tag"            # nym-node tag for which the tunnel was last evaluated
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
@@ -125,7 +127,7 @@ bin_version() {           # extract "Build Version: X.Y.Z" from a nym binary; em
 
 # Resolve everything from the saved config first, falling back to live detection.
 resolve_target() {
-  UNIT=""; BIN=""; SVC_USER=""; ROLE=""; BRIDGE_UNIT=""; BRIDGE_BIN=""
+  UNIT=""; BIN=""; SVC_USER=""; ROLE=""; BRIDGE_UNIT=""; BRIDGE_BIN=""; NTM_ENABLED=""; NTM_PATH=""; NTM_IFACE=""
   if [[ -f "$CONFIG_FILE" ]]; then
     # only trust the config if it is root-owned and not group/other-writable (we source it as root)
     if [[ "$(stat -c '%U' "$CONFIG_FILE" 2>/dev/null || echo '?')" == "root" \
@@ -142,19 +144,25 @@ resolve_target() {
   [[ -n "${BRIDGE_UNIT:-}" ]] || BRIDGE_UNIT="$(detect_bridge_unit)"
   if [[ -n "${BRIDGE_UNIT:-}" && -z "${BRIDGE_BIN:-}" ]]; then BRIDGE_BIN="$(detect_bridge_bin "$BRIDGE_UNIT")"; fi
   [[ -n "${ROLE:-}" ]]        || ROLE="$(detect_role "$UNIT")"
+  if [[ -z "${NTM_ENABLED:-}" ]]; then IFS=$'\t' read -r NTM_ENABLED NTM_PATH NTM_IFACE < <(detect_ntm) || true; fi
+  [[ -n "${NTM_IFACE:-}" ]] || NTM_IFACE="nymtun0"
+  [[ -n "${NTM_PATH:-}" ]]  || NTM_PATH="/usr/local/sbin/network-tunnel-manager.sh"
 }
 
 save_config() {
   cat > "$CONFIG_FILE" <<EOF
 # nym-node-autoupdate config - written by 'install', read on every run.
 # Edit by hand if your setup changes, or re-run: $DEST_PATH install
-# Leave BRIDGE_UNIT empty to disable QUIC-bridge updates.
+# Leave BRIDGE_UNIT empty to disable QUIC-bridge updates; set NTM_ENABLED=0 to disable tunnel checks.
 UNIT="$1"
 BIN="$2"
 SVC_USER="$3"
 ROLE="$4"
 BRIDGE_UNIT="$5"
 BRIDGE_BIN="$6"
+NTM_ENABLED="$7"
+NTM_PATH="$8"
+NTM_IFACE="$9"
 EOF
   chmod 0644 "$CONFIG_FILE"
 }
@@ -306,6 +314,110 @@ update_component() {
   return "$rc"
 }
 
+# ------------------- network tunnel manager (gateways only) -----------------
+# NTM is a SCRIPT (not a service) that sets up the exit-gateway iptables/forwarding/tunnel rules.
+# We never execute the changelog as instructions: it is used ONLY as a signal that this release
+# touches the tunnel/ports, then we run NTM's own (version-matched, tag-pinned) apply + self-test.
+detect_ntm() {            # echoes "<enabled>\t<path>\t<iface>"
+  local en=0 path="" iface="nymtun0"
+  ip link show nymtun0 >/dev/null 2>&1 && en=1
+  path="$(ls -1 /usr/local/sbin/network-tunnel-manager.sh /root/network-tunnel-manager.sh /root/network_tunnel_manager.sh 2>/dev/null | head -n1 || true)"
+  [[ -n "$path" ]] && en=1
+  [[ -n "$path" ]] || path="/usr/local/sbin/network-tunnel-manager.sh"
+  printf '%s\t%s\t%s\n' "$en" "$path" "$iface"
+}
+
+# Scan ONLY this release's changelog section for tunnel/port relevance. arg: tag
+# stdout = matched lines; return 0 = relevant, 1 = not relevant, 2 = could not read/parse.
+changelog_mentions_ntm() {
+  local tag="$1" cl ver section matched
+  cl="$(curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --max-time 45 \
+        "https://raw.githubusercontent.com/$REPO/$tag/CHANGELOG.md" 2>/dev/null)" || return 2
+  ver="${tag#${TAG_PREFIX}}"
+  section="$(printf '%s\n' "$cl" | awk -v v="$ver" '
+    $0 ~ "^## \\[" v "\\]" {f=1; next}
+    f && /^## \[/ {exit}
+    f {print}')"
+  [[ -n "$section" ]] || return 2
+  matched="$(printf '%s\n' "$section" | grep -iE 'tunnel|iptables|firewall|\bports?\b|wireguard|nymtun|forwarding|routing|exit.?polic' || true)"
+  [[ -n "$matched" ]] || return 1
+  printf '%s\n' "$matched"
+}
+
+# Run one NTM subcommand with a timeout, logging its output. args: <ntm_path> <cmd> [arg...]
+ntm_run() {
+  local p="$1"; shift
+  local out code
+  if out="$(timeout 150 bash "$p" "$@" 2>&1)"; then code=0; else code=$?; fi
+  log "[ntm] \`$*\` exit=$code"
+  printf '%s\n' "$out" | sed 's/^/[ntm]   /' >> "$LOGFILE" 2>/dev/null || true
+  return "$code"
+}
+
+ntm_selftest() {          # arg: ntm_path ; return 0 = tunnel verified healthy
+  ntm_run "$1" check_nymtun_iptables   || return 1
+  ntm_run "$1" joke_through_the_mixnet || return 1
+  return 0
+}
+
+# Evaluate / apply tunnel rules after a nym-node release. Gateways only. NEVER aborts the run.
+maybe_run_ntm() {
+  [[ "${NTM_ENABLED:-0}" == "1" ]] || return 0
+  local iface="${NTM_IFACE:-nymtun0}" dest="${NTM_PATH:-/usr/local/sbin/network-tunnel-manager.sh}"
+  local tag; tag="$(cat "$STATE_TAG" 2>/dev/null || true)"
+  [[ -n "$tag" ]] || return 0
+  local ntm_last; ntm_last="$(cat "$NTM_STATE" 2>/dev/null || true)"
+  [[ "$tag" != "$ntm_last" ]] || return 0       # already evaluated the tunnel for this release
+
+  log "[ntm] evaluating exit-gateway tunnel for release $tag"
+
+  local mentioned=0 matched crc
+  if matched="$(changelog_mentions_ntm "$tag")"; then crc=0; else crc=$?; fi
+  if   (( crc == 0 )); then mentioned=1; log "[ntm] changelog for $tag mentions tunnel/ports:"; printf '%s\n' "$matched" | sed 's/^/[ntm]   /' >> "$LOGFILE" 2>/dev/null || true
+  elif (( crc == 1 )); then log "[ntm] changelog for $tag has no tunnel/port changes"
+  else                       log "[ntm] could not read changelog for $tag; deciding on self-test only"; fi
+  log "[ntm] changelog: https://github.com/$REPO/blob/$tag/CHANGELOG.md"
+
+  local tmp rc=0; tmp="$(mktemp -d /tmp/nym-autoupdate-ntm.XXXXXX)"
+  while :; do
+    if ! curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --max-time 120 \
+           -o "$tmp/ntm.sh" "https://raw.githubusercontent.com/$REPO/$tag/$NTM_REPO_PATH"; then
+      log "[ntm] could not download tag-pinned NTM for $tag; leaving the tunnel untouched"; rc=0; break
+    fi
+    chmod +x "$tmp/ntm.sh"
+    log "[ntm] fetched NTM @ $tag (sha256 $(sha256sum "$tmp/ntm.sh" | awk '{print $1}'))"
+
+    local healthy=1
+    if ntm_selftest "$tmp/ntm.sh"; then log "[ntm] self-test OK (tunnel passing traffic)"; else healthy=0; log "[ntm] self-test FAILED"; fi
+
+    if (( mentioned == 0 && healthy == 1 )); then
+      log "[ntm] nothing to do (no changelog mention, tunnel healthy)"; printf '%s\n' "$tag" > "$NTM_STATE"; rc=0; break
+    fi
+
+    log "[ntm] applying tunnel rules (changelog_mentioned=$mentioned tunnel_healthy=$healthy)"
+    ntm_run "$tmp/ntm.sh" adjust_ip_forwarding         || true
+    ntm_run "$tmp/ntm.sh" apply_iptables_rules         || true
+    ntm_run "$tmp/ntm.sh" apply_iptables_rules_wg      || true
+    ntm_run "$tmp/ntm.sh" configure_dns_and_icmp_wg    || true
+    ntm_run "$tmp/ntm.sh" remove_duplicate_rules "$iface" || true
+    ip link show nymwg >/dev/null 2>&1 && { ntm_run "$tmp/ntm.sh" remove_duplicate_rules nymwg || true; }
+
+    if ntm_selftest "$tmp/ntm.sh"; then
+      command -v netfilter-persistent >/dev/null 2>&1 && { netfilter-persistent save >/dev/null 2>&1 || true; }
+      install -m 0755 "$tmp/ntm.sh" "$dest" 2>/dev/null || true
+      log "[ntm] SUCCESS: tunnel healthy after apply; rules persisted; NTM saved to $dest"
+      notify success "NTM tunnel rules applied for $tag; tunnel healthy"
+      printf '%s\n' "$tag" > "$NTM_STATE"; rc=0; break
+    fi
+    log "[ntm] CRITICAL: tunnel still failing after apply for $tag - MANUAL CHECK NEEDED (firewall changes are not auto-rolled-back)."
+    notify failed "NTM apply for $tag did not restore the tunnel on this gateway; manual intervention needed"
+    printf '%s\n' "$tag" > "$NTM_STATE"   # record to avoid hourly firewall thrash; clear $NTM_STATE to retry
+    rc=1; break
+  done
+  rm -rf "$tmp"
+  return "$rc"
+}
+
 # --------------------------------- run --------------------------------------
 cmd_run() {
   ensure_dirs
@@ -326,8 +438,11 @@ cmd_run() {
                      "$BRIDGE_BIN" "$BRIDGE_UNIT" "$BRIDGE_STATE_TAG" "$BRIDGE_FAILED_TAGS" "runs" || bridge_rc=$?
   fi
 
-  log "run complete (nym-node rc=$node_rc, nym-bridge rc=$bridge_rc)"
-  if (( node_rc != 0 || bridge_rc != 0 )); then exit 1; fi
+  local ntm_rc=0
+  maybe_run_ntm || ntm_rc=$?
+
+  log "run complete (nym-node rc=$node_rc, nym-bridge rc=$bridge_rc, ntm rc=$ntm_rc)"
+  if (( node_rc != 0 || bridge_rc != 0 || ntm_rc != 0 )); then exit 1; fi
   exit 0
 }
 
@@ -339,6 +454,8 @@ cmd_install() {
   role="$(detect_role "$unit")"; curver="$(bin_version "${bin:-/bin/false}")"
   brunit="$(detect_bridge_unit)"; brbin=""; brver=""
   if [[ -n "$brunit" ]]; then brbin="$(detect_bridge_bin "$brunit")"; brver="$(dpkg-query -W -f='${Version}' nym-bridge 2>/dev/null || true)"; fi
+  local ntm_en ntm_path ntm_iface
+  IFS=$'\t' read -r ntm_en ntm_path ntm_iface < <(detect_ntm) || true
 
   echo "Detected on $(hostname):"
   echo "  nym-node unit : ${unit:-<NOT FOUND>}"
@@ -351,6 +468,11 @@ cmd_install() {
   else
     echo "  QUIC bridge   : none (mixnode / no bridge)   -> bridge updates skipped"
   fi
+  if [[ "$ntm_en" == "1" ]]; then
+    echo "  tunnel (NTM)  : exit gateway (iface ${ntm_iface}) -> checked per release, changelog-gated; script ${ntm_path}"
+  else
+    echo "  tunnel (NTM)  : not an exit gateway -> NTM step skipped"
+  fi
   echo
 
   if [[ "${NYM_ASSUME_YES:-0}" != "1" && -t 0 ]]; then
@@ -362,6 +484,11 @@ cmd_install() {
       read -rp "  service user    [${svcuser}]: " a; svcuser="${a:-$svcuser}"
       read -rp "  bridge unit (blank=none) [${brunit}]: " a; brunit="${a-$brunit}"
       if [[ -n "$brunit" ]]; then read -rp "  bridge bin    [${brbin}]: " a; brbin="${a:-$brbin}"; else brbin=""; fi
+      read -rp "  enable NTM tunnel checks? (1/0) [${ntm_en}]: " a; ntm_en="${a:-$ntm_en}"
+      if [[ "$ntm_en" == "1" ]]; then
+        read -rp "  NTM script path [${ntm_path}]: " a;  ntm_path="${a:-$ntm_path}"
+        read -rp "  tunnel iface    [${ntm_iface}]: " a; ntm_iface="${a:-$ntm_iface}"
+      fi
     fi
   else
     log "non-interactive install; using detected values"
@@ -376,13 +503,13 @@ cmd_install() {
     [[ -n "$brbin" && -x "$brbin" ]] || die "bridge binary '$brbin' missing or not executable; aborting"
   fi
 
-  save_config "$unit" "$bin" "${svcuser:-root}" "$role" "$brunit" "$brbin"
-  log "saved config -> $CONFIG_FILE (unit=$unit bin=$bin user=${svcuser:-root} bridge=${brunit:-none})"
+  save_config "$unit" "$bin" "${svcuser:-root}" "$role" "$brunit" "$brbin" "${ntm_en:-0}" "$ntm_path" "${ntm_iface:-nymtun0}"
+  log "saved config -> $CONFIG_FILE (unit=$unit bin=$bin user=${svcuser:-root} bridge=${brunit:-none} ntm=${ntm_en:-0})"
 
   install -m 0755 "$SELF_PATH" "$DEST_PATH"
   cat > /etc/systemd/system/nym-node-autoupdate.service <<UNIT
 [Unit]
-Description=nym-node auto-updater (check GitHub, update nym-node + QUIC bridge if new stable releases exist)
+Description=nym-node auto-updater (nym-node + QUIC bridge + tunnel rules on new stable releases)
 After=network-online.target
 Wants=network-online.target
 
@@ -440,6 +567,12 @@ cmd_status() {
     echo "bridge failed : $(tr '\n' ' ' < "$BRIDGE_FAILED_TAGS" 2>/dev/null || true)"
   else
     echo "bridge        : none (updates skipped)"
+  fi
+  if [[ "${NTM_ENABLED:-0}" == "1" ]]; then
+    echo "tunnel (NTM)  : enabled  iface=${NTM_IFACE:-nymtun0}  script=${NTM_PATH:-<?>}"
+    echo "ntm last_tag  : $(cat "$NTM_STATE" 2>/dev/null || echo '<none>')"
+  else
+    echo "tunnel (NTM)  : disabled (not an exit gateway)"
   fi
   echo "config        : $( [[ -f "$CONFIG_FILE" ]] && echo "$CONFIG_FILE" || echo '<none - live detection>')"
   if [[ -f /etc/systemd/system/nym-node-autoupdate.timer ]]; then

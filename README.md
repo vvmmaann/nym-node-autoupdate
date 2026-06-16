@@ -17,6 +17,16 @@ releases it does nothing. It is designed to never leave a node down.
   Source: `github.com/nymtech/nym-bridges` (tags `bridge-binaries-v*`). Those releases ship no checksum
   file, so the bridge binary is verified by HTTPS + a smoke test rather than SHA-256, and swapped with
   the same backup/rollback machinery as `nym-node`. A mixnode has no bridge, so this step is skipped.
+- **Network Tunnel Manager (NTM)** - **exit gateways only**. This is `network-tunnel-manager.sh`
+  (a script, not a binary) that sets up the gateway's iptables / forwarding / tunnel rules. After a
+  `nym-node` release the updater reads **only that release's CHANGELOG.md section** as a *signal* - it
+  never executes the changelog as instructions. If the section mentions tunnel / ports / firewall /
+  wireguard (or if a tunnel self-test fails), it fetches the **tag-matched** NTM from `nymtech/nym`
+  (`scripts/nym-node-setup/network-tunnel-manager.sh`), runs its own `apply_iptables_rules*` +
+  `remove_duplicate_rules` + self-test, then persists the rules with `netfilter-persistent`. Exit-policy
+  changes are only **logged, never auto-applied**. Unlike a binary swap, firewall changes are **not**
+  auto-rolled-back, so a failed apply raises a loud alert for manual follow-up. Detected via the
+  `nymtun0` interface.
 
 The script detects the node's role automatically; you do not configure it per role.
 
