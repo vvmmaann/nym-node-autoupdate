@@ -27,9 +27,10 @@ releases it does nothing. It is designed to never leave a node down.
   tunnel IP must reach the internet - this catches a broken FORWARD/MASQUERADE, unlike the upstream
   check which always passes). Before applying it **snapshots the live firewall** (`iptables-save`), and
   if the probe fails after apply it **reverts** to the snapshot and re-persists. Exit-policy changes are
-  only **logged, never auto-applied**. The NTM script ships no upstream checksum, so it is pinned to the
-  release tag, fetched over HTTPS, and its sha256 logged - the same trust model as fetching it by hand.
-  Detected via the `nymtun0` interface.
+  only **logged, never auto-applied**, and the tunnel step is skipped entirely if the firewall cannot
+  be snapshotted (no unsafe apply without a revert path). The NTM script ships no upstream checksum, so
+  it is pinned to the release's **commit SHA** (immutable), fetched over HTTPS, and run as root - see
+  the Trust model section. Detected via the `nymtun0` interface.
 
 The script detects the node's role automatically; you do not configure it per role.
 
@@ -155,5 +156,29 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 ## Requirements
 
-`bash`, `systemd`, `curl`, `jq`, `flock`, `sha256sum` (all present on a standard Debian/Ubuntu
-nym-node host). Run as root (needs to replace the binary and restart the service).
+`bash`, `systemd`, `curl`, `jq`, `flock`, `sha256sum`, `cmp`, `timeout`. `jq` is **not** in a base
+Debian/Ubuntu install and `curl` is often absent on minimal images, so install what's missing:
+
+```bash
+sudo apt-get install -y curl jq coreutils util-linux
+```
+
+The script **hard-fails loudly** (the systemd unit goes red) if a required command is missing, so a
+missing dependency can never turn it into a silent no-op. Exit gateways additionally use
+`iptables-save`/`iptables-restore` and (ideally) `netfilter-persistent` for the tunnel step; if those
+are absent it safely **skips** the tunnel step rather than touching the firewall with no revert path.
+
+Run `run`/`install` as root (it replaces the binary and manages systemd; it will `sudo` itself if
+needed). `check`/`status` are read-only and need no root.
+
+## Trust model (be aware before running as root)
+
+- **nym-node** is SHA-256 verified against the release's `hashes.json` and **refuses to install**
+  without a checksum. This is integrity, not authenticity (Nym ships no signatures) - trust still
+  reduces to "GitHub + the nymtech release account are uncompromised", same as a manual install.
+- **nym-bridge** ships no upstream checksum: updates are trusted on HTTPS + GitHub release integrity
+  only (verified by a smoke-test, swapped with the same backup/rollback as nym-node).
+- **NTM** (exit gateways) is fetched from the nym repo **pinned to the release's commit SHA** (an
+  immutable ref, not a mutable tag) and **run as root**. There is no upstream checksum/signature, so
+  this trusts the integrity of the nym GitHub org - the same as running their documented tunnel setup
+  by hand. Set `NTM_ENABLED=0` (or answer the install prompt) to opt out entirely.

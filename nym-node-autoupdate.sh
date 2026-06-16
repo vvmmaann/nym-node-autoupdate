@@ -3,25 +3,28 @@
 # nym-node-autoupdate.sh
 # Safe, self-contained, ROLE-AWARE auto-updater for a Nym node under systemd.
 #
-# It keeps two things current, with the same safety machinery for both:
-#   * nym-node       - the one binary that runs in ANY role (mixnode / entry-gw / exit-gw).
-#                      Source: github.com/nymtech/nym  (tags nym-binaries-v*), sha256-verified.
-#   * nym-bridge     - the QUIC bridge, GATEWAYS ONLY. Updated only if nym-bridge.service exists.
-#                      Source: github.com/nymtech/nym-bridges (tags bridge-binaries-v*).
+# Keeps current, with the same safety machinery for each:
+#   * nym-node   - the one binary that runs in ANY role (mixnode / entry-gw / exit-gw).
+#                  Source: github.com/nymtech/nym (tags nym-binaries-v*), SHA-256 verified.
+#   * nym-bridge - the QUIC bridge, GATEWAYS ONLY (only if nym-bridge.service exists).
+#                  Source: github.com/nymtech/nym-bridges. Ships NO upstream checksum, so it is
+#                  trusted on HTTPS + GitHub release integrity only (no independent verification).
+#   * NTM        - the exit-gateway tunnel rules (network-tunnel-manager.sh), EXIT GATEWAYS ONLY.
+#                  Fetched from github.com/nymtech/nym and RUN AS ROOT. There is no upstream
+#                  checksum/signature; this trusts the integrity of the nym GitHub org, the same
+#                  as running their documented install by hand. Set NTM_ENABLED=0 to opt out.
 #
 # Two phases:
-#   * INSTALL (interactive) - run the script once. It auto-detects the nym-node unit, the user it
-#       runs as, the binary path, the node role, and (on gateways) the nym-bridge unit/binary;
-#       shows you what it found; lets you CONFIRM or CORRECT it; saves it to
-#       /etc/nym-node-autoupdate.conf; then installs a systemd timer for the hourly checks.
-#   * RUN (unattended) - the timer calls "run" hourly. For each component, if a genuinely new
-#       stable release exists, it downloads it, verifies it, swaps the binary, restarts the
-#       service, and ROLLS BACK automatically if the service does not come back healthy.
+#   * INSTALL (interactive) - run once. Auto-detects unit/user/binary/role and (on gateways) the
+#       bridge + tunnel; shows it; lets you confirm or correct; saves /etc/nym-node-autoupdate.conf;
+#       installs a systemd timer for the hourly checks.
+#   * RUN (unattended) - the timer calls "run" hourly. For each component, if a genuinely new stable
+#       release exists it downloads, verifies, swaps the binary, restarts, and ROLLS BACK if the
+#       service does not come back healthy.
 #
-# Safety: binaries are checksum-verified (when the release ships hashes) and smoke-tested before
-# install; the only downtime is the stop->copy->start window; any failure restores the previous
-# binary; a release that fails its health check is recorded and never retried. It is built so it
-# can never leave a node down.
+# It is built so it can never leave a node down: download/verify happens before anything is touched;
+# the binary swap is an atomic rename; any failure restores the previous binary; the firewall is
+# snapshotted before NTM changes and reverted if a real egress probe fails afterwards.
 #
 # Subcommands:
 #   nym-node-autoupdate.sh            # same as 'install' (interactive setup)
@@ -32,28 +35,33 @@
 #   nym-node-autoupdate.sh uninstall  # remove the timer (leaves config, state and binaries alone)
 #
 set -euo pipefail
+# Ensure sbin dirs are on PATH so `ip`, `iptables-save`, etc. resolve even for a non-root check/status.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
 # ------------------------------- configuration -------------------------------
 REPO="nymtech/nym";          TAG_PREFIX="nym-binaries-v";    ASSET="nym-node"
 BRIDGE_REPO="nymtech/nym-bridges"; BRIDGE_TAG_PREFIX="bridge-binaries-v"; BRIDGE_ASSET="nym-bridge"
-NTM_REPO_PATH="scripts/nym-node-setup/network-tunnel-manager.sh"  # tunnel manager, fetched tag-pinned from $REPO
+NTM_REPO_PATH="scripts/nym-node-setup/network-tunnel-manager.sh"  # tunnel manager, from $REPO
 
 MIN_AGE_HOURS="${NYM_MIN_AGE_HOURS:-2}"     # ignore releases younger than this (soak delay)
 HEALTH_WAIT="${NYM_HEALTH_WAIT:-25}"        # seconds to wait after restart before health check
 KEEP_BACKUPS="${NYM_KEEP_BACKUPS:-3}"       # how many old binaries to keep, per component
-# fall back to defaults if an operator set a non-numeric value, else sleep/arithmetic would abort under set -e/-u
+# fall back to defaults on non-numeric input, else sleep/arithmetic would abort under set -e/-u
 [[ "$MIN_AGE_HOURS" =~ ^[0-9]+$ ]] || MIN_AGE_HOURS=2
 [[ "$HEALTH_WAIT"   =~ ^[0-9]+$ ]] || HEALTH_WAIT=25
 [[ "$KEEP_BACKUPS"  =~ ^[0-9]+$ ]] || KEEP_BACKUPS=3
+# --retry-all-errors needs curl >= 7.71; probe once so we never hard-fail on older LTS curl.
+RETRY_ALL=""
+if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then RETRY_ALL="--retry-all-errors"; fi
 
-CONFIG_FILE="/etc/nym-node-autoupdate.conf" # written by install, read on every run
+CONFIG_FILE="/etc/nym-node-autoupdate.conf"
 STATE_DIR="/var/lib/nym-autoupdate"
 LOGFILE="/var/log/nym-autoupdate.log"
 LOCKFILE="/run/nym-autoupdate.lock"
 BACKUP_DIR="$STATE_DIR/backups"
 STATE_TAG="$STATE_DIR/last_tag";               FAILED_TAGS="$STATE_DIR/failed_tags"
 BRIDGE_STATE_TAG="$STATE_DIR/bridge_last_tag"; BRIDGE_FAILED_TAGS="$STATE_DIR/bridge_failed_tags"
-NTM_STATE="$STATE_DIR/ntm_last_tag"            # nym-node tag for which the tunnel was last evaluated
+NTM_STATE="$STATE_DIR/ntm_last_tag"
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
@@ -68,7 +76,8 @@ log() {
 die() { log "ERROR: $*"; exit 1; }
 
 # Optional alerting hook. Called as: notify <success|rollback|failed> <message>.
-# No-op by default; drop a curl to your Telegram/webhook here if you want pings.
+# No-op by default. NOTE: $2 may contain GitHub-controlled tag text - always quote it and pass via
+# --data-urlencode; never build a shell command out of it.
 notify() { :; }
 
 ensure_dirs() {
@@ -76,12 +85,24 @@ ensure_dirs() {
   touch "$FAILED_TAGS" "$BRIDGE_FAILED_TAGS" 2>/dev/null || true
 }
 
-# Re-run under sudo when not root (install/run/uninstall must replace binaries + manage systemd).
+# Hard-fail (unit goes red) if a required command is missing, instead of silently never updating.
+require_cmds() {
+  local c missing=""
+  for c in "$@"; do command -v "$c" >/dev/null 2>&1 || missing="$missing $c"; done
+  [[ -z "$missing" ]] || die "missing required command(s):$missing  (try: apt-get install -y curl jq coreutils)"
+}
+
+# Re-run under sudo when not root. Prefer the vetted installed copy over the (possibly writable)
+# downloaded SELF_PATH, and refuse rather than hang if sudo would prompt with no terminal.
 need_root() {
   if [[ "$(id -u)" -eq 0 ]]; then return 0; fi
+  local self="$SELF_PATH"; [[ -x "$DEST_PATH" ]] && self="$DEST_PATH"
   if command -v sudo >/dev/null 2>&1; then
-    echo "not root; re-running via sudo..."
-    exec sudo -E -- "$SELF_PATH" "$@"
+    if sudo -n true 2>/dev/null || [[ -t 0 ]]; then
+      echo "not root; re-running via sudo..."
+      exec sudo -E -- "$self" "$@"
+    fi
+    die "needs root and sudo would prompt but there is no terminal; run as root"
   fi
   die "this needs root (replaces binaries and manages systemd). Re-run as root or install sudo."
 }
@@ -95,7 +116,7 @@ detect_bridge_unit() {
   systemctl list-units --all --type=service --no-legend 2>/dev/null \
     | awk '{print $1}' | grep -E '^nym-bridge(@[^.]*)?\.service$' | head -n1 || true
 }
-detect_bin() {            # binary path for the given unit (absolute from ExecStart, else via PATH)
+detect_bin() {
   local unit="${1:-}" p
   p="$(systemctl show -p ExecStart --value "$unit" 2>/dev/null | grep -oP 'path=\K\S+' | head -n1 || true)"
   if [[ "$p" == /* && -x "$p" ]]; then printf '%s\n' "$p"; return 0; fi
@@ -112,7 +133,7 @@ detect_user() {
   u="$(systemctl show -p User --value "$unit" 2>/dev/null || true)"
   printf '%s\n' "${u:-root}"
 }
-detect_role() {           # best-effort label for display/logging
+detect_role() {
   local unit="${1:-}" es
   if [[ -n "$(detect_bridge_unit)" ]]; then echo "gateway (has QUIC bridge)"; return; fi
   es="$(systemctl show -p ExecStart --value "$unit" 2>/dev/null || true)"
@@ -122,7 +143,16 @@ detect_role() {           # best-effort label for display/logging
     *)                              echo "node (role set in config [modes])" ;;
   esac
 }
-bin_version() {           # extract "Build Version: X.Y.Z" from a nym binary; empty if none
+# NTM is enabled ONLY when the live tunnel interface exists (a leftover script file is just a path hint,
+# never an enable signal - otherwise a former-gateway-now-mixnode would run tunnel apply on a dead iface).
+detect_ntm() {            # echoes "<enabled>\t<path>\t<iface>"
+  local en=0 path="" iface="nymtun0"
+  ip link show "$iface" >/dev/null 2>&1 && en=1
+  path="$(ls -1 /usr/local/sbin/network-tunnel-manager.sh /root/network-tunnel-manager.sh /root/network_tunnel_manager.sh 2>/dev/null | head -n1 || true)"
+  [[ -n "$path" ]] || path="/usr/local/sbin/network-tunnel-manager.sh"
+  printf '%s\t%s\t%s\n' "$en" "$path" "$iface"
+}
+bin_version() {
   "$1" --version 2>/dev/null | grep -ioP 'build version:\s*\K[0-9][0-9.]*' | head -n1 || true
 }
 
@@ -147,6 +177,7 @@ resolve_target() {
   [[ -n "${ROLE:-}" ]]        || ROLE="$(detect_role "$UNIT")"
   if [[ -z "${NTM_ENABLED:-}" ]]; then IFS=$'\t' read -r NTM_ENABLED NTM_PATH NTM_IFACE < <(detect_ntm) || true; fi
   [[ -n "${NTM_IFACE:-}" ]] || NTM_IFACE="nymtun0"
+  [[ "$NTM_IFACE" =~ ^[a-zA-Z0-9._-]+$ ]] || NTM_IFACE="nymtun0"   # sanity: never let junk reach iptables/ip
   [[ -n "${NTM_PATH:-}" ]]  || NTM_PATH="/usr/local/sbin/network-tunnel-manager.sh"
 }
 
@@ -169,21 +200,21 @@ EOF
 }
 
 # ------------------------------- github lookup ------------------------------
-# curl with an automatic IPv4 retry: some hosts advertise an IPv6 default route that is actually
-# dead (e.g. release-assets.githubusercontent.com over a broken v6 path), which resets mid-transfer.
-gcurl() { curl "$@" || curl -4 "$@"; }
+# gcurl: curl with an automatic IPv4 retry for hosts whose advertised IPv6 route is actually dead
+# (resets mid-transfer). ONLY safe with -o to a file - in a $() capture it would concatenate the
+# partial IPv6 attempt with the IPv4 retry. The short --connect-timeout hands off to IPv4 fast.
+gcurl() { curl --connect-timeout 8 "$@" || curl -4 --connect-timeout 8 "$@"; }
 
 gh_releases() {           # arg: owner/repo ; prints releases JSON
   local url="https://api.github.com/repos/$1/releases?per_page=100" out
-  out="$(curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 5 --max-time 45 \
+  out="$(curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --retry 3 --retry-delay 5 --max-time 45 \
          -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$url")" \
-   || out="$(curl -4 -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 5 --max-time 45 \
+   || out="$(curl -4 -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --retry 3 --retry-delay 5 --max-time 45 \
          -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$url")" \
    || return 1
   printf '%s' "$out"
 }
-# From releases JSON on stdin, emit "tag<TAB>published<TAB>asset_url<TAB>hashes_url"
-# for the newest stable release (tag startswith prefix) that carries the asset. args: prefix asset
+# From releases JSON on stdin, emit "tag<TAB>published<TAB>asset_url<TAB>hashes_url". args: prefix asset
 pick_latest() {
   jq -r --arg pref "$1" --arg asset "$2" '
     [ .[]
@@ -199,29 +230,50 @@ pick_latest() {
 }
 age_hours() { [[ -n "${1:-}" ]] || return 1; local pub now; pub="$(date -u -d "$1" +%s 2>/dev/null)" || return 1; now="$(date -u +%s)"; printf '%s\n' "$(( (now - pub) / 3600 ))"; }
 
-# is_healthy <unit> <bin> <expected_version_or_empty> - samples SubState twice over ~8s.
-# Used identically by the forward install AND the rollback, so a rollback is verified as strictly.
+# ---- failed-release memory: count failures (auto-retry once; blacklist after 2; expire after 7d) ----
+fail_count() { awk -F'\t' -v t="$2" '$1==t{c=$2} END{print c+0}' "$1" 2>/dev/null || echo 0; }
+record_fail() {
+  local ff="$1" t="$2" n now tmp
+  n="$(fail_count "$ff" "$t")"; n=$((n+1)); now="$(date -u +%s)"
+  tmp="$(mktemp 2>/dev/null)" || return 0
+  awk -F'\t' -v t="$t" '$1!=t' "$ff" 2>/dev/null > "$tmp" || true
+  printf '%s\t%s\t%s\n' "$t" "$n" "$now" >> "$tmp"
+  mv -f "$tmp" "$ff" 2>/dev/null || rm -f "$tmp"
+}
+is_blacklisted() {        # return 0 = skip this tag
+  local ff="$1" t="$2" line n ts now
+  line="$(awk -F'\t' -v t="$t" '$1==t{print; exit}' "$ff" 2>/dev/null || true)"
+  [[ -n "$line" ]] || return 1
+  n="$(printf '%s' "$line" | cut -f2)"; ts="$(printf '%s' "$line" | cut -f3)"; now="$(date -u +%s)"
+  [[ "$ts" =~ ^[0-9]+$ ]] && (( now - ts > 604800 )) && return 1   # expired -> allow a retry
+  [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 2 )) && return 0
+  return 1
+}
+
+# is_healthy <unit> <bin> <expected_version_or_empty> - active at two samples ~8s apart, with no
+# restart between them (crash-loop guard). Works for Type=simple/forking/notify/oneshot+RemainAfterExit
+# (does NOT demand SubState=running or a live main PID, which false-fail healthy non-simple units).
 is_healthy() {
-  local u="$1" b="$2" expect="${3:-}" sub1 sub2 pid2 active rv
-  sub1="$(systemctl show -p SubState --value "$u" 2>/dev/null || true)"
+  local u="$1" b="$2" expect="${3:-}" a1 a2 t1 t2 rv
+  a1="$(systemctl is-active "$u" 2>/dev/null || true)"
+  t1="$(systemctl show -p ActiveEnterTimestampMonotonic --value "$u" 2>/dev/null || echo 0)"
   sleep 8
-  sub2="$(systemctl show -p SubState --value "$u" 2>/dev/null || true)"
-  pid2="$(systemctl show -p ExecMainPID --value "$u" 2>/dev/null || echo 0)"
-  active="$(systemctl is-active "$u" 2>/dev/null || true)"
-  # primary liveness: active, running at both samples (catches crash-loops), live main PID
-  [[ "$active" == "active" && "$sub1" == "running" && "$sub2" == "running" && "$pid2" != "0" ]] || return 1
-  # version: only a hard fail when we expect a version AND can parse one AND it differs (unparseable = inconclusive = pass)
+  a2="$(systemctl is-active "$u" 2>/dev/null || true)"
+  t2="$(systemctl show -p ActiveEnterTimestampMonotonic --value "$u" 2>/dev/null || echo 0)"
+  [[ "$a1" == "active" && "$a2" == "active" ]] || return 1
+  [[ "$t1" == "$t2" ]] || return 1
   if [[ -n "$expect" ]]; then
     rv="$(bin_version "$b")"
-    [[ -z "$rv" || "$rv" == "$expect" ]] || return 1
+    [[ -z "$rv" || "$rv" == "$expect" ]] || return 1   # unparseable version = inconclusive = pass
   fi
   return 0
 }
 
 # ----------------------- the generic component updater ----------------------
 # update_component <name> <repo> <tagprefix> <asset> <bin> <unit> <statefile> <failedfile> <smoke>
-#   smoke = "version" (nym-node: must report a build version) | "runs" (nym-bridge: --help must work)
-# Returns: 0 = updated or nothing-to-do; 1 = aborted/rolled-back (service still up); 2 = critical.
+#   smoke = "version" (nym-node: must report a build version; refuses install without a checksum)
+#         | "runs"    (nym-bridge: --help must work; no upstream checksum, HTTPS+smoke only)
+# Returns: 0 = updated or nothing-to-do; 1 = aborted/rolled-back (service up); 2 = critical.
 update_component() {
   local NAME="$1" CREPO="$2" CPREF="$3" CASSET="$4" CBIN="$5" CUNIT="$6" CSTATE="$7" CFAILED="$8" SMODE="$9"
   local curver=""
@@ -236,20 +288,21 @@ update_component() {
 
   local last; last="$(cat "$CSTATE" 2>/dev/null || true)"
   [[ "$tag" != "$last" ]]                        || { log "[$NAME] already on latest ($tag); nothing to do"; return 0; }
-  if grep -qxF "$tag" "$CFAILED" 2>/dev/null; then log "[$NAME] WARNING: $tag previously failed its health check here; staying on the current binary (clear $CFAILED to retry)"; return 0; fi
+  if is_blacklisted "$CFAILED" "$tag"; then log "[$NAME] WARNING: $tag failed its health check >=2x here; staying put (clear $CFAILED to retry)"; return 0; fi
 
-  local age; age="$(age_hours "$published")" || age=9999
+  local age; age="$(age_hours "$published")" || { log "[$NAME] cannot parse release age for $tag; deferring this cycle"; return 0; }
   if (( age < MIN_AGE_HOURS )); then log "[$NAME] newest $tag only ${age}h old (< ${MIN_AGE_HOURS}h); waiting"; return 0; fi
   log "[$NAME] new release available: $tag (published $published, ~${age}h ago)"
 
-  local tmp rc=0; tmp="$(mktemp -d /tmp/nym-autoupdate.XXXXXX)"
+  local tmp rc=0
+  tmp="$(mktemp -d "$STATE_DIR/tmp.XXXXXX" 2>/dev/null)" || { log "[$NAME] mktemp failed; skip this cycle"; return 0; }
   while :; do
-    if ! gcurl -fsSL --proto '=https' --proto-redir '=https' --retry 5 --retry-all-errors --retry-delay 5 --max-time 600 -o "$tmp/bin" "$url"; then
+    if ! gcurl -fsSL --proto '=https' --proto-redir '=https' --retry 5 $RETRY_ALL --retry-delay 5 --max-time 600 -o "$tmp/bin" "$url"; then
       log "[$NAME] download failed (after retries over IPv6+IPv4); skip this cycle"; rc=0; break
     fi
 
     local want=""
-    if [[ -n "$hashurl" ]] && gcurl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-all-errors --max-time 60 -o "$tmp/hashes.json" "$hashurl"; then
+    if [[ -n "$hashurl" ]] && gcurl -fsSL --proto '=https' --proto-redir '=https' --retry 3 $RETRY_ALL --max-time 60 -o "$tmp/hashes.json" "$hashurl"; then
       want="$(jq -r --arg a "$CASSET" '.assets[$a].sha256 // empty' "$tmp/hashes.json" 2>/dev/null || true)"
     fi
     if [[ -n "$want" ]]; then
@@ -277,32 +330,36 @@ update_component() {
     fi
 
     # nothing to do if the new binary is byte-identical to the installed one
-    # (covers same-version re-releases, and the bridge which has no version string to compare)
     if cmp -s "$tmp/bin" "$CBIN"; then
       log "[$NAME] $tag is byte-identical to the installed binary; recording tag, no restart"
       printf '%s\n' "$tag" > "$CSTATE"; rc=0; break
     fi
 
-    # backup (preserve owner/mode) -> stop -> install -> start
-    local owner mode stamp backup
+    # backup, then stage the new binary next to the target (same fs) BEFORE stopping, so the swap
+    # is a single atomic rename and the live binary is never a half-written file.
+    local owner mode stamp backup dir staged
     owner="$(stat -c '%U:%G' "$CBIN" 2>/dev/null || echo root:root)"
     mode="$(stat -c '%a' "$CBIN" 2>/dev/null || echo 755)"
     stamp="$(date -u '+%Y%m%dT%H%M%SZ')"
     backup="$BACKUP_DIR/${NAME}.${curver:-prev}.$stamp"
+    dir="$(dirname "$CBIN")"; staged="$dir/.nau-new.$$"
     if ! cp -a "$CBIN" "$backup"; then log "[$NAME] backup failed; aborting (no change made)"; rc=1; break; fi
     log "[$NAME] backed up -> $backup (owner=$owner mode=$mode)"
+    if ! install -m "$mode" -o "${owner%:*}" -g "${owner#*:}" "$tmp/bin" "$staged" 2>/dev/null; then
+      log "[$NAME] could not stage new binary in $dir; aborting (no change made)"; rm -f "$staged" 2>/dev/null || true; rc=1; break
+    fi
 
     log "[$NAME] stopping $CUNIT"
     systemctl stop "$CUNIT" || log "[$NAME] warning: stop returned non-zero"
-    if ! install -m "$mode" -o "${owner%:*}" -g "${owner#*:}" "$tmp/bin" "$CBIN"; then
-      log "[$NAME] install failed; restoring backup"
-      cp -a "$backup" "$CBIN" || log "[$NAME] CRITICAL: restore copy failed ($backup -> $CBIN)"
+    if ! mv -f "$staged" "$CBIN"; then
+      log "[$NAME] atomic swap failed; restoring previous binary"
+      rm -f "$staged" 2>/dev/null || true
+      cp -a "$backup" "$CBIN" 2>/dev/null || log "[$NAME] CRITICAL: restore after failed swap failed ($backup -> $CBIN)"
       systemctl start "$CUNIT" || true; rc=1; break
     fi
     log "[$NAME] installed new binary; starting $CUNIT"
     systemctl start "$CUNIT" || log "[$NAME] warning: start returned non-zero"
 
-    # health-gate the new binary (active + running across an ~8s window + version match if known)
     sleep "$HEALTH_WAIT"
     if is_healthy "$CUNIT" "$CBIN" "$newver"; then
       printf '%s\n' "$tag" > "$CSTATE"
@@ -312,15 +369,17 @@ update_component() {
       rc=0; break
     fi
 
-    # rollback: restore the previous binary, record the bad tag, then verify just as strictly
+    # rollback: restore the previous binary (atomically), record the failure, verify just as strictly
     log "[$NAME] HEALTH CHECK FAILED for $tag; ROLLING BACK to previous binary"
     systemctl stop "$CUNIT" || true
-    cp -a "$backup" "$CBIN" || log "[$NAME] CRITICAL: rollback restore copy failed ($backup -> $CBIN)"
+    if cp -a "$backup" "$dir/.nau-rb.$$" 2>/dev/null && mv -f "$dir/.nau-rb.$$" "$CBIN" 2>/dev/null; then :; else
+      log "[$NAME] CRITICAL: rollback restore failed ($backup -> $CBIN)"; rm -f "$dir/.nau-rb.$$" 2>/dev/null || true
+    fi
     systemctl start "$CUNIT" || true
-    printf '%s\n' "$tag" >> "$CFAILED"
+    record_fail "$CFAILED" "$tag"
     sleep "$HEALTH_WAIT"
     if is_healthy "$CUNIT" "$CBIN" "$curver"; then
-      log "[$NAME] ROLLBACK OK: restored ${curver:-previous} binary, $CUNIT healthy again. $tag marked failed (clear $CFAILED to retry)."
+      log "[$NAME] ROLLBACK OK: restored ${curver:-previous} binary, $CUNIT healthy again. $tag failure recorded."
       notify rollback "$NAME update to $tag FAILED; rolled back to ${curver:-previous}, $CUNIT is UP"; rc=1; break
     fi
     log "[$NAME] CRITICAL: rollback did NOT restore a healthy $CUNIT. MANUAL INTERVENTION NEEDED."
@@ -331,24 +390,12 @@ update_component() {
 }
 
 # ------------------- network tunnel manager (gateways only) -----------------
-# NTM is a SCRIPT (not a service) that sets up the exit-gateway iptables/forwarding/tunnel rules.
-# We never execute the changelog as instructions: it is used ONLY as a signal that this release
-# touches the tunnel/ports, then we run NTM's own (version-matched, tag-pinned) apply + self-test.
-detect_ntm() {            # echoes "<enabled>\t<path>\t<iface>"
-  local en=0 path="" iface="nymtun0"
-  ip link show nymtun0 >/dev/null 2>&1 && en=1
-  path="$(ls -1 /usr/local/sbin/network-tunnel-manager.sh /root/network-tunnel-manager.sh /root/network_tunnel_manager.sh 2>/dev/null | head -n1 || true)"
-  [[ -n "$path" ]] && en=1
-  [[ -n "$path" ]] || path="/usr/local/sbin/network-tunnel-manager.sh"
-  printf '%s\t%s\t%s\n' "$en" "$path" "$iface"
-}
-
 # Scan ONLY this release's changelog section for tunnel/port relevance. arg: tag
 # stdout = matched lines; return 0 = relevant, 1 = not relevant, 2 = could not read/parse.
 changelog_mentions_ntm() {
   local tag="$1" cl ver section matched
-  cl="$(curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --max-time 45 "https://raw.githubusercontent.com/$REPO/$tag/CHANGELOG.md" 2>/dev/null)" \
-    || cl="$(curl -4 -fsSL --proto '=https' --proto-redir '=https' --retry 3 --max-time 45 "https://raw.githubusercontent.com/$REPO/$tag/CHANGELOG.md" 2>/dev/null)" \
+  cl="$(curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --retry 3 --max-time 45 "https://raw.githubusercontent.com/$REPO/$tag/CHANGELOG.md" 2>/dev/null)" \
+    || cl="$(curl -4 -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --retry 3 --max-time 45 "https://raw.githubusercontent.com/$REPO/$tag/CHANGELOG.md" 2>/dev/null)" \
     || return 2
   ver="${tag#${TAG_PREFIX}}"
   section="$(printf '%s\n' "$cl" | awk -v hdr="## [$ver]" '
@@ -356,16 +403,14 @@ changelog_mentions_ntm() {
     f && /^## \[/ {exit}
     f {print}')"
   [[ -n "$section" ]] || return 2
-  # high-precision: explicit tunnel/firewall signals only (generic words like "port"/"forwarding"/
-  # "routing" caused false triggers, e.g. "Testing port checks in NS Agents"). The real egress probe
-  # is the primary safety net for anything this misses.
+  # high-precision signals only (generic words like "port"/"forwarding" caused false triggers,
+  # e.g. "Testing port checks in NS Agents"). The real egress probe is the primary safety net.
   matched="$(printf '%s\n' "$section" | grep -iE 'network.?tunnel.?manager|nymtun|iptables|firewall|wireguard|open[^.]{0,20}\bports?\b|new[^.]{0,15}\bports?\b' || true)"
   [[ -n "$matched" ]] || return 1
   printf '%s\n' "$matched"
 }
 
-# Run one NTM subcommand with a timeout, logging its output. args: <ntm_path> <cmd> [arg...]
-ntm_run() {
+ntm_run() {               # args: <ntm_path> <cmd> [arg...]  -- run an NTM subcommand, log its output
   local p="$1"; shift
   local out code
   if out="$(timeout 150 bash "$p" "$@" 2>&1)"; then code=0; else code=$?; fi
@@ -374,17 +419,22 @@ ntm_run() {
   return "$code"
 }
 
-ntm_selftest() {          # arg: iface ; return 0 = tunnel verified egressing (independent, hard-failing probe)
-  local iface="$1" addr
-  addr="$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)"
-  [[ -n "$addr" ]] || { log "[ntm] probe: $iface has no IPv4 address"; return 1; }
-  [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" == "1" ]] || { log "[ntm] probe: ip_forward is off"; return 1; }
-  iptables -S FORWARD 2>/dev/null | grep -q -- "$iface" || { log "[ntm] probe: no FORWARD rule for $iface"; return 1; }
-  iptables -t nat -S POSTROUTING 2>/dev/null | grep -qi masquerade || { log "[ntm] probe: no nat MASQUERADE rule"; return 1; }
-  # end-to-end: a packet sourced from the tunnel IP must reach the internet (exercises FORWARD + MASQUERADE)
-  curl --interface "$addr" -fsS --max-time 10 -o /dev/null https://icanhazip.com 2>/dev/null && return 0
-  ping -c1 -W4 -I "$addr" 1.1.1.1 >/dev/null 2>&1 && return 0
-  log "[ntm] probe: no egress from $iface (src $addr) - forwarding/masquerade broken"; return 1
+# Independent, hard-failing probe: a packet SOURCED FROM the tunnel IP must reach the internet.
+# This proves FORWARD + MASQUERADE end-to-end regardless of ruleset structure (chain/direct/nft).
+ntm_selftest() {          # arg: iface ; return 0 = egressing
+  local iface="$1" a4 a6
+  a4="$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
+  a6="$(ip -6 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -v '^fe80' | head -n1 || true)"
+  [[ -n "$a4$a6" ]] || { log "[ntm] probe: $iface has no usable IP"; return 1; }
+  if [[ -n "$a4" ]]; then
+    curl --interface "$a4" -fsS --max-time 10 -o /dev/null https://icanhazip.com 2>/dev/null && return 0
+    ping -c1 -W4 -I "$a4" 1.1.1.1 >/dev/null 2>&1 && return 0
+  fi
+  if [[ -n "$a6" ]]; then
+    curl -g --interface "$a6" -fsS --max-time 10 -o /dev/null https://icanhazip.com 2>/dev/null && return 0
+    ping6 -c1 -W4 -I "$a6" 2606:4700:4700::1111 >/dev/null 2>&1 && return 0
+  fi
+  log "[ntm] probe: no egress from $iface (v4=${a4:-none} v6=${a6:-none}) - forwarding/masquerade broken"; return 1
 }
 
 # Evaluate / apply tunnel rules after a nym-node release. Gateways only. NEVER aborts the run.
@@ -405,14 +455,21 @@ maybe_run_ntm() {
   else                       log "[ntm] could not read changelog for $tag; deciding on self-test only"; fi
   log "[ntm] changelog: https://github.com/$REPO/blob/$tag/CHANGELOG.md"
 
-  local tmp rc=0; tmp="$(mktemp -d /tmp/nym-autoupdate-ntm.XXXXXX)"
+  local tmp rc=0
+  tmp="$(mktemp -d "$STATE_DIR/ntm.XXXXXX" 2>/dev/null)" || { log "[ntm] mktemp failed; skip"; return 0; }
   while :; do
-    if ! gcurl -fsSL --proto '=https' --proto-redir '=https' --retry 5 --retry-all-errors --retry-delay 5 --max-time 180 \
-           -o "$tmp/ntm.sh" "https://raw.githubusercontent.com/$REPO/$tag/$NTM_REPO_PATH"; then
-      log "[ntm] could not download tag-pinned NTM for $tag; leaving the tunnel untouched"; rc=0; break
+    # content-pin: resolve the (mutable) tag to its immutable commit SHA and fetch the script by SHA.
+    local sha ntm_ref
+    sha="$(curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --retry 2 --max-time 30 \
+           -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/commits/$tag" 2>/dev/null \
+           | jq -r '.sha // empty' 2>/dev/null || true)"
+    ntm_ref="${sha:-$tag}"
+    if ! gcurl -fsSL --proto '=https' --proto-redir '=https' --retry 5 $RETRY_ALL --retry-delay 5 --max-time 180 \
+           -o "$tmp/ntm.sh" "https://raw.githubusercontent.com/$REPO/$ntm_ref/$NTM_REPO_PATH"; then
+      log "[ntm] could not download NTM for $tag (ref $ntm_ref); leaving the tunnel untouched"; rc=0; break
     fi
     chmod +x "$tmp/ntm.sh"
-    log "[ntm] fetched NTM @ $tag (sha256 $(sha256sum "$tmp/ntm.sh" | awk '{print $1}'))"
+    log "[ntm] fetched NTM @ $ntm_ref (sha256 $(sha256sum "$tmp/ntm.sh" | awk '{print $1}'); no upstream checksum, trusts nym GitHub org)"
 
     local healthy=1
     if ntm_selftest "$iface"; then log "[ntm] pre-apply self-test OK (tunnel egressing)"; else healthy=0; log "[ntm] pre-apply self-test FAILED (tunnel not egressing)"; fi
@@ -421,9 +478,15 @@ maybe_run_ntm() {
       log "[ntm] nothing to do (no changelog mention, tunnel healthy)"; printf '%s\n' "$tag" > "$NTM_STATE"; rc=0; break
     fi
 
-    # snapshot the live firewall first so a bad apply can be reverted (upstream apply persists rules mid-run)
+    # we will only modify the firewall if we can snapshot it (so a bad apply can be reverted)
+    if ! command -v iptables-save >/dev/null 2>&1 || ! command -v iptables-restore >/dev/null 2>&1; then
+      log "[ntm] iptables-save/restore unavailable; SKIPPING apply (no safe revert path on this host)"; printf '%s\n' "$tag" > "$NTM_STATE"; rc=0; break
+    fi
     iptables-save  > "$tmp/v4.bak" 2>/dev/null || true
     ip6tables-save > "$tmp/v6.bak" 2>/dev/null || true
+    if [[ ! -s "$tmp/v4.bak" ]]; then
+      log "[ntm] firewall snapshot empty (nft-native host?); SKIPPING apply to stay safe"; printf '%s\n' "$tag" > "$NTM_STATE"; rc=0; break
+    fi
 
     log "[ntm] applying tunnel rules (changelog_mentioned=$mentioned tunnel_healthy=$healthy)"
     ntm_run "$tmp/ntm.sh" adjust_ip_forwarding         || true
@@ -434,7 +497,8 @@ maybe_run_ntm() {
     ip link show nymwg >/dev/null 2>&1 && { ntm_run "$tmp/ntm.sh" remove_duplicate_rules nymwg || true; }
 
     if ntm_selftest "$iface"; then
-      command -v netfilter-persistent >/dev/null 2>&1 && { netfilter-persistent save >/dev/null 2>&1 || true; }
+      command -v netfilter-persistent >/dev/null 2>&1 && { netfilter-persistent save >/dev/null 2>&1 || true; } \
+        || log "[ntm] note: netfilter-persistent absent - rules may not survive reboot"
       install -m 0755 "$tmp/ntm.sh" "$dest" 2>/dev/null || true
       log "[ntm] SUCCESS: tunnel egressing after apply; rules persisted; NTM saved to $dest"
       notify success "NTM tunnel rules applied for $tag; tunnel healthy"
@@ -443,7 +507,7 @@ maybe_run_ntm() {
 
     # apply broke the tunnel -> revert the firewall to the pre-apply snapshot and re-persist
     log "[ntm] post-apply self-test FAILED for $tag; REVERTING firewall to pre-apply snapshot"
-    [[ -s "$tmp/v4.bak" ]] && { iptables-restore  < "$tmp/v4.bak" 2>/dev/null || log "[ntm] WARN: iptables-restore failed"; }
+    iptables-restore  < "$tmp/v4.bak" 2>/dev/null || log "[ntm] WARN: iptables-restore failed"
     [[ -s "$tmp/v6.bak" ]] && { ip6tables-restore < "$tmp/v6.bak" 2>/dev/null || log "[ntm] WARN: ip6tables-restore failed"; }
     command -v netfilter-persistent >/dev/null 2>&1 && { netfilter-persistent save >/dev/null 2>&1 || true; }
     printf '%s\n' "$tag" > "$NTM_STATE"   # record to avoid hourly thrash; clear $NTM_STATE to retry
@@ -453,7 +517,7 @@ maybe_run_ntm() {
       rc=1; break
     fi
     log "[ntm] CRITICAL: tunnel still failing after revert for $tag - MANUAL INTERVENTION NEEDED."
-    notify failed "CRITICAL: NTM apply for $tag broke the tunnel AND revert did not restore it on this gateway"
+    notify failed "CRITICAL: NTM apply for $tag broke the tunnel AND revert did not restore it"
     rc=2; break
   done
   rm -rf "$tmp"
@@ -506,12 +570,12 @@ cmd_install() {
   echo "  version       : ${curver:-<unknown>}"
   echo "  role          : ${role}"
   if [[ -n "$brunit" ]]; then
-    echo "  QUIC bridge   : ${brunit}  bin=${brbin:-<?>}  ver=${brver:-<?>}   -> WILL be auto-updated"
+    echo "  QUIC bridge   : ${brunit}  bin=${brbin:-<?>}  ver=${brver:-<?>}   -> auto-updated (HTTPS only, no upstream checksum)"
   else
     echo "  QUIC bridge   : none (mixnode / no bridge)   -> bridge updates skipped"
   fi
   if [[ "$ntm_en" == "1" ]]; then
-    echo "  tunnel (NTM)  : exit gateway (iface ${ntm_iface}) -> checked per release, changelog-gated; script ${ntm_path}"
+    echo "  tunnel (NTM)  : exit gateway (iface ${ntm_iface}) -> checked per release; runs nymtech NTM as root (no upstream checksum)"
   else
     echo "  tunnel (NTM)  : not an exit gateway -> NTM step skipped"
   fi
@@ -544,6 +608,7 @@ cmd_install() {
     systemctl cat "$brunit" >/dev/null 2>&1 || die "bridge unit '$brunit' not found by systemd; aborting"
     [[ -n "$brbin" && -x "$brbin" ]] || die "bridge binary '$brbin' missing or not executable; aborting"
   fi
+  [[ "${ntm_iface:-nymtun0}" =~ ^[a-zA-Z0-9._-]+$ ]] || ntm_iface="nymtun0"
 
   save_config "$unit" "$bin" "${svcuser:-root}" "$role" "$brunit" "$brbin" "${ntm_en:-0}" "$ntm_path" "${ntm_iface:-nymtun0}"
   log "saved config -> $CONFIG_FILE (unit=$unit bin=$bin user=${svcuser:-root} bridge=${brunit:-none} ntm=${ntm_en:-0})"
@@ -619,7 +684,7 @@ cmd_check() {             # read-only: report whether newer releases exist (no c
     ntm_inst="$(cat "$NTM_STATE" 2>/dev/null || echo '<none>')"
     if   [[ "$lt" == "$ntm_inst" ]]; then echo "tunnel(NTM): already evaluated for $lt"
     elif changelog_mentions_ntm "$lt" >/dev/null 2>&1; then echo "tunnel(NTM): $lt changelog mentions tunnel/ports -> NTM would re-apply on next run"
-    else echo "tunnel(NTM): $lt changelog has no tunnel/port changes (NTM re-applies only if a self-test fails)"; fi
+    else echo "tunnel(NTM): $lt changelog has no tunnel/port changes (NTM re-applies only if the egress probe fails)"; fi
   fi
   echo
   echo "To apply now: sudo $DEST_PATH run"
@@ -632,13 +697,12 @@ cmd_status() {
   echo "nym-node bin  : ${BIN:-<none found>}"
   echo "version       : $(bin_version "${BIN:-/bin/false}")"
   echo "role          : ${ROLE:-<unknown>}"
-  echo "active         : $(systemctl is-active "${UNIT:-nonexistent.service}" 2>/dev/null || true)"
+  echo "active        : $(systemctl is-active "${UNIT:-nonexistent.service}" 2>/dev/null || true)"
   echo "node last_tag : $(cat "$STATE_TAG" 2>/dev/null || echo '<none>')"
-  echo "node failed   : $(tr '\n' ' ' < "$FAILED_TAGS" 2>/dev/null || true)"
+  echo "node failed   : $(cut -f1 "$FAILED_TAGS" 2>/dev/null | tr '\n' ' ' || true)"
   if [[ -n "${BRIDGE_UNIT:-}" ]]; then
     echo "bridge unit   : ${BRIDGE_UNIT}  bin=${BRIDGE_BIN:-<?>}  active=$(systemctl is-active "$BRIDGE_UNIT" 2>/dev/null || true)"
     echo "bridge last   : $(cat "$BRIDGE_STATE_TAG" 2>/dev/null || echo '<none>')"
-    echo "bridge failed : $(tr '\n' ' ' < "$BRIDGE_FAILED_TAGS" 2>/dev/null || true)"
   else
     echo "bridge        : none (updates skipped)"
   fi
@@ -646,7 +710,7 @@ cmd_status() {
     echo "tunnel (NTM)  : enabled  iface=${NTM_IFACE:-nymtun0}  script=${NTM_PATH:-<?>}"
     echo "ntm last_tag  : $(cat "$NTM_STATE" 2>/dev/null || echo '<none>')"
   else
-    echo "tunnel (NTM)  : disabled (not an exit gateway)"
+    echo "tunnel (NTM)  : disabled (no $NTM_IFACE interface / not an exit gateway)"
   fi
   echo "config        : $( [[ -f "$CONFIG_FILE" ]] && echo "$CONFIG_FILE" || echo '<none - live detection>')"
   if [[ -f /etc/systemd/system/nym-node-autoupdate.timer ]]; then
@@ -662,13 +726,13 @@ main() {
   case "$cmd" in
     run)
       need_root "$@"
-      command -v flock >/dev/null 2>&1 || die "flock not found; refusing to run without single-instance locking"
+      require_cmds curl jq sha256sum flock
       exec 9>"$LOCKFILE"
       flock -n 9 || { echo "another nym-autoupdate run is in progress; exiting"; exit 0; }
       cmd_run ;;
-    install)   need_root "$@"; cmd_install ;;
+    install)   need_root "$@"; require_cmds curl jq sha256sum; cmd_install ;;
     uninstall) need_root "$@"; cmd_uninstall ;;
-    check)     cmd_check ;;
+    check)     require_cmds curl jq; cmd_check ;;
     status)    cmd_status ;;
     *) echo "usage: $0 {install|run|check|status|uninstall}"; exit 1 ;;
   esac
