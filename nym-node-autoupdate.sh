@@ -36,9 +36,13 @@ set -euo pipefail
 REPO="nymtech/nym";          TAG_PREFIX="nym-binaries-v";    ASSET="nym-node"
 BRIDGE_REPO="nymtech/nym-bridges"; BRIDGE_TAG_PREFIX="bridge-binaries-v"; BRIDGE_ASSET="nym-bridge"
 
-MIN_AGE_HOURS="${NYM_MIN_AGE_HOURS:-2}"     # ignore releases younger than this (anti-yank buffer)
+MIN_AGE_HOURS="${NYM_MIN_AGE_HOURS:-2}"     # ignore releases younger than this (soak delay)
 HEALTH_WAIT="${NYM_HEALTH_WAIT:-25}"        # seconds to wait after restart before health check
 KEEP_BACKUPS="${NYM_KEEP_BACKUPS:-3}"       # how many old binaries to keep, per component
+# fall back to defaults if an operator set a non-numeric value, else sleep/arithmetic would abort under set -e/-u
+[[ "$MIN_AGE_HOURS" =~ ^[0-9]+$ ]] || MIN_AGE_HOURS=2
+[[ "$HEALTH_WAIT"   =~ ^[0-9]+$ ]] || HEALTH_WAIT=25
+[[ "$KEEP_BACKUPS"  =~ ^[0-9]+$ ]] || KEEP_BACKUPS=3
 
 CONFIG_FILE="/etc/nym-node-autoupdate.conf" # written by install, read on every run
 STATE_DIR="/var/lib/nym-autoupdate"
@@ -123,8 +127,14 @@ bin_version() {           # extract "Build Version: X.Y.Z" from a nym binary; em
 resolve_target() {
   UNIT=""; BIN=""; SVC_USER=""; ROLE=""; BRIDGE_UNIT=""; BRIDGE_BIN=""
   if [[ -f "$CONFIG_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$CONFIG_FILE" || true
+    # only trust the config if it is root-owned and not group/other-writable (we source it as root)
+    if [[ "$(stat -c '%U' "$CONFIG_FILE" 2>/dev/null || echo '?')" == "root" \
+          && -z "$(find "$CONFIG_FILE" -perm /022 2>/dev/null)" ]]; then
+      # shellcheck disable=SC1090
+      source "$CONFIG_FILE" || true
+    else
+      log "WARNING: $CONFIG_FILE is not root-owned or is writable by others; ignoring it, using live detection"
+    fi
   fi
   [[ -n "${UNIT:-}" ]]        || UNIT="$(detect_unit)"
   [[ -n "${BIN:-}" ]]         || BIN="$(detect_bin "$UNIT")"
@@ -151,9 +161,9 @@ EOF
 
 # ------------------------------- github lookup ------------------------------
 gh_releases() {           # arg: owner/repo
-  curl -fsSL --retry 3 --retry-delay 5 --max-time 45 \
+  curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 5 --max-time 45 \
        -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
-       "https://api.github.com/repos/$1/releases?per_page=30"
+       "https://api.github.com/repos/$1/releases?per_page=100"
 }
 # From releases JSON on stdin, emit "tag<TAB>published<TAB>asset_url<TAB>hashes_url"
 # for the newest stable release (tag startswith prefix) that carries the asset. args: prefix asset
@@ -170,7 +180,26 @@ pick_latest() {
         ((.assets[] | select(.name=="hashes.json") | .browser_download_url) // "") ] | @tsv
   '
 }
-age_hours() { local pub now; pub="$(date -u -d "$1" +%s 2>/dev/null)" || return 1; now="$(date -u +%s)"; printf '%s\n' "$(( (now - pub) / 3600 ))"; }
+age_hours() { [[ -n "${1:-}" ]] || return 1; local pub now; pub="$(date -u -d "$1" +%s 2>/dev/null)" || return 1; now="$(date -u +%s)"; printf '%s\n' "$(( (now - pub) / 3600 ))"; }
+
+# is_healthy <unit> <bin> <expected_version_or_empty> - samples SubState twice over ~8s.
+# Used identically by the forward install AND the rollback, so a rollback is verified as strictly.
+is_healthy() {
+  local u="$1" b="$2" expect="${3:-}" sub1 sub2 pid2 active rv
+  sub1="$(systemctl show -p SubState --value "$u" 2>/dev/null || true)"
+  sleep 8
+  sub2="$(systemctl show -p SubState --value "$u" 2>/dev/null || true)"
+  pid2="$(systemctl show -p ExecMainPID --value "$u" 2>/dev/null || echo 0)"
+  active="$(systemctl is-active "$u" 2>/dev/null || true)"
+  # primary liveness: active, running at both samples (catches crash-loops), live main PID
+  [[ "$active" == "active" && "$sub1" == "running" && "$sub2" == "running" && "$pid2" != "0" ]] || return 1
+  # version: only a hard fail when we expect a version AND can parse one AND it differs (unparseable = inconclusive = pass)
+  if [[ -n "$expect" ]]; then
+    rv="$(bin_version "$b")"
+    [[ -z "$rv" || "$rv" == "$expect" ]] || return 1
+  fi
+  return 0
+}
 
 # ----------------------- the generic component updater ----------------------
 # update_component <name> <repo> <tagprefix> <asset> <bin> <unit> <statefile> <failedfile> <smoke>
@@ -190,7 +219,7 @@ update_component() {
 
   local last; last="$(cat "$CSTATE" 2>/dev/null || true)"
   [[ "$tag" != "$last" ]]                        || { log "[$NAME] already on latest ($tag); nothing to do"; return 0; }
-  if grep -qxF "$tag" "$CFAILED" 2>/dev/null; then log "[$NAME] $tag previously failed here; skipping (clear $CFAILED to retry)"; return 0; fi
+  if grep -qxF "$tag" "$CFAILED" 2>/dev/null; then log "[$NAME] WARNING: $tag previously failed its health check here; staying on the current binary (clear $CFAILED to retry)"; return 0; fi
 
   local age; age="$(age_hours "$published")" || age=9999
   if (( age < MIN_AGE_HOURS )); then log "[$NAME] newest $tag only ${age}h old (< ${MIN_AGE_HOURS}h); waiting"; return 0; fi
@@ -198,20 +227,22 @@ update_component() {
 
   local tmp rc=0; tmp="$(mktemp -d /tmp/nym-autoupdate.XXXXXX)"
   while :; do
-    if ! curl -fsSL --retry 3 --retry-delay 5 --max-time 300 -o "$tmp/bin" "$url"; then
+    if ! curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 5 --max-time 300 -o "$tmp/bin" "$url"; then
       log "[$NAME] download failed; skip"; rc=0; break
     fi
 
     local want=""
-    if [[ -n "$hashurl" ]] && curl -fsSL --retry 3 --max-time 60 -o "$tmp/hashes.json" "$hashurl"; then
+    if [[ -n "$hashurl" ]] && curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --max-time 60 -o "$tmp/hashes.json" "$hashurl"; then
       want="$(jq -r --arg a "$CASSET" '.assets[$a].sha256 // empty' "$tmp/hashes.json" 2>/dev/null || true)"
     fi
     if [[ -n "$want" ]]; then
       local got; got="$(sha256sum "$tmp/bin" | awk '{print $1}')"
       if [[ "$got" != "$want" ]]; then log "[$NAME] SHA-256 mismatch for $tag (want $want got $got) - NOT installing"; rc=1; break; fi
       log "[$NAME] sha256 verified ok"
+    elif [[ "$SMODE" == "version" && "${NYM_ALLOW_UNVERIFIED:-0}" != "1" ]]; then
+      log "[$NAME] no checksum available for $tag; REFUSING to install (set NYM_ALLOW_UNVERIFIED=1 to override)"; rc=1; break
     else
-      log "[$NAME] WARNING: no published checksum for $tag; proceeding without sha256 verification"
+      log "[$NAME] no published checksum for $tag; proceeding on HTTPS + smoke test (expected for this component)"
     fi
 
     chmod +x "$tmp/bin"
@@ -240,46 +271,36 @@ update_component() {
     log "[$NAME] stopping $CUNIT"
     systemctl stop "$CUNIT" || log "[$NAME] warning: stop returned non-zero"
     if ! install -m "$mode" -o "${owner%:*}" -g "${owner#*:}" "$tmp/bin" "$CBIN"; then
-      log "[$NAME] install failed; restoring backup"; cp -a "$backup" "$CBIN"; systemctl start "$CUNIT" || true; rc=1; break
+      log "[$NAME] install failed; restoring backup"
+      cp -a "$backup" "$CBIN" || log "[$NAME] CRITICAL: restore copy failed ($backup -> $CBIN)"
+      systemctl start "$CUNIT" || true; rc=1; break
     fi
     log "[$NAME] installed new binary; starting $CUNIT"
     systemctl start "$CUNIT" || log "[$NAME] warning: start returned non-zero"
 
-    # health: active + running + PID stable over a 2nd window (+ version match if known)
-    local pid1 pid2 active substate runver healthy=1
+    # health-gate the new binary (active + running across an ~8s window + version match if known)
     sleep "$HEALTH_WAIT"
-    pid1="$(systemctl show -p ExecMainPID --value "$CUNIT" 2>/dev/null || echo 0)"
-    sleep 8
-    pid2="$(systemctl show -p ExecMainPID --value "$CUNIT" 2>/dev/null || echo 0)"
-    active="$(systemctl is-active "$CUNIT" 2>/dev/null || true)"
-    substate="$(systemctl show -p SubState --value "$CUNIT" 2>/dev/null || true)"
-    [[ "$active" == "active" ]]    || healthy=0
-    [[ "$substate" == "running" ]] || healthy=0
-    [[ "$pid1" != "0" && "$pid1" == "$pid2" ]] || healthy=0
-    if [[ -n "$newver" ]]; then runver="$(bin_version "$CBIN")"; [[ "$runver" == "$newver" ]] || healthy=0; fi
-
-    if (( healthy == 1 )); then
+    if is_healthy "$CUNIT" "$CBIN" "$newver"; then
       printf '%s\n' "$tag" > "$CSTATE"
-      log "[$NAME] SUCCESS: $CUNIT healthy on ${newver:-$tag} [active=$active sub=$substate pid=$pid1]"
+      log "[$NAME] SUCCESS: $CUNIT healthy on ${newver:-$tag}"
       notify success "$NAME updated to ${newver:-$tag} and healthy"
-      ls -1t "$BACKUP_DIR/${NAME}."* 2>/dev/null | tail -n +$((KEEP_BACKUPS+1)) | xargs -r rm -f
+      ls -1t "$BACKUP_DIR/${NAME}."* 2>/dev/null | tail -n +$((KEEP_BACKUPS+1)) | xargs -r rm -f || true
       rc=0; break
     fi
 
-    # rollback
-    log "[$NAME] HEALTH CHECK FAILED [active=$active sub=$substate pid=$pid1/$pid2]; ROLLING BACK"
+    # rollback: restore the previous binary, record the bad tag, then verify just as strictly
+    log "[$NAME] HEALTH CHECK FAILED for $tag; ROLLING BACK to previous binary"
     systemctl stop "$CUNIT" || true
-    cp -a "$backup" "$CBIN"
+    cp -a "$backup" "$CBIN" || log "[$NAME] CRITICAL: rollback restore copy failed ($backup -> $CBIN)"
     systemctl start "$CUNIT" || true
-    sleep "$HEALTH_WAIT"
     printf '%s\n' "$tag" >> "$CFAILED"
-    local active2; active2="$(systemctl is-active "$CUNIT" 2>/dev/null || true)"
-    if [[ "$active2" == "active" ]]; then
-      log "[$NAME] ROLLBACK OK: restored previous binary, $CUNIT active again. $tag marked failed (won't retry)."
-      notify rollback "$NAME update to $tag FAILED; rolled back, $CUNIT is UP"; rc=1; break
+    sleep "$HEALTH_WAIT"
+    if is_healthy "$CUNIT" "$CBIN" "$curver"; then
+      log "[$NAME] ROLLBACK OK: restored ${curver:-previous} binary, $CUNIT healthy again. $tag marked failed (clear $CFAILED to retry)."
+      notify rollback "$NAME update to $tag FAILED; rolled back to ${curver:-previous}, $CUNIT is UP"; rc=1; break
     fi
-    log "[$NAME] CRITICAL: rollback did NOT restore $CUNIT. MANUAL INTERVENTION NEEDED."
-    notify failed "CRITICAL: $NAME update to $tag failed AND rollback failed on $CUNIT"; rc=2; break
+    log "[$NAME] CRITICAL: rollback did NOT restore a healthy $CUNIT. MANUAL INTERVENTION NEEDED."
+    notify failed "CRITICAL: $NAME update to $tag failed AND rollback unhealthy on $CUNIT"; rc=2; break
   done
   rm -rf "$tmp"
   return "$rc"
@@ -432,7 +453,12 @@ cmd_status() {
 main() {
   local cmd="${1:-install}"
   case "$cmd" in
-    run)       need_root "$@"; exec 9>"$LOCKFILE"; flock -n 9 || { echo "another run in progress; exiting"; exit 0; }; cmd_run ;;
+    run)
+      need_root "$@"
+      command -v flock >/dev/null 2>&1 || die "flock not found; refusing to run without single-instance locking"
+      exec 9>"$LOCKFILE"
+      flock -n 9 || { echo "another nym-autoupdate run is in progress; exiting"; exit 0; }
+      cmd_run ;;
     install)   need_root "$@"; cmd_install ;;
     uninstall) need_root "$@"; cmd_uninstall ;;
     status)    cmd_status ;;

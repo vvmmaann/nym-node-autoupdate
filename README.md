@@ -22,18 +22,25 @@ The script detects the node's role automatically; you do not configure it per ro
 
 ## Why it is safe
 
-- **Checksum verified** - the downloaded binary is checked against the SHA-256 published in the
-  release's `hashes.json` before it is ever installed. A mismatch aborts with no changes.
+- **Checksum verified** - the downloaded `nym-node` binary is checked against the SHA-256 published
+  in the release's `hashes.json` before it is ever installed; a mismatch aborts with no changes, and
+  a missing checksum makes it refuse to install (override with `NYM_ALLOW_UNVERIFIED=1`). Note this is
+  an **integrity** check (catches corruption/truncation/partial tampering), not an authenticity one:
+  Nym's `nym-binaries-v*` line ships no signatures, so trust still reduces to "GitHub and the nymtech
+  release account are uncompromised" - the same assumption as a manual install.
 - **Smoke tested** - the new binary must run `--version` successfully before it is installed.
 - **Automatic rollback** - after restart it checks the service is `active`, `running`, on the new
   version, and not crash-looping (PID stable across a second window). If any check fails it restores
   the previous binary and restarts. A release that fails is recorded and never retried (until you
   clear it), so it cannot churn-restart your node forever.
 - **Backups kept** - the previous binaries are kept under `/var/lib/nym-autoupdate/backups`.
-- **Minimal downtime** - the only downtime is the stop -> copy -> start window (a couple of seconds);
-  all download/verify work happens before the service is touched.
-- **Anti-yank buffer** - a release younger than `MIN_AGE_HOURS` (default 2h) is ignored, so a release
-  that gets pulled shortly after publishing is not grabbed in its risky first hours.
+- **Minimal downtime on success** - when the new binary is healthy the only downtime is the
+  stop -> copy -> start window (a couple of seconds); all download/verify work happens before the
+  service is touched. On a *failed* swap the node is down for roughly `HEALTH_WAIT` (~25s) until the
+  health check fails and the rollback restores the old binary - still bounded, but not "a couple of seconds".
+- **Soak delay** - a release younger than `MIN_AGE_HOURS` (default 2h) is not adopted yet, so brand-new
+  releases are given time to settle. This is a delay, not yank-detection: it does not actively check
+  whether a release was later pulled or demoted.
 - **Single instance** - protected by `flock`, so overlapping runs cannot collide.
 
 ## Auto-detection + confirmation
