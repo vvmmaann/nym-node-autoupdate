@@ -351,8 +351,8 @@ changelog_mentions_ntm() {
     || cl="$(curl -4 -fsSL --proto '=https' --proto-redir '=https' --retry 3 --max-time 45 "https://raw.githubusercontent.com/$REPO/$tag/CHANGELOG.md" 2>/dev/null)" \
     || return 2
   ver="${tag#${TAG_PREFIX}}"
-  section="$(printf '%s\n' "$cl" | awk -v v="$ver" '
-    $0 ~ "^## \\[" v "\\]" {f=1; next}
+  section="$(printf '%s\n' "$cl" | awk -v hdr="## [$ver]" '
+    index($0, hdr)==1 {f=1; next}
     f && /^## \[/ {exit}
     f {print}')"
   [[ -n "$section" ]] || return 2
@@ -371,10 +371,17 @@ ntm_run() {
   return "$code"
 }
 
-ntm_selftest() {          # arg: ntm_path ; return 0 = tunnel verified healthy
-  ntm_run "$1" check_nymtun_iptables   || return 1
-  ntm_run "$1" joke_through_the_mixnet || return 1
-  return 0
+ntm_selftest() {          # arg: iface ; return 0 = tunnel verified egressing (independent, hard-failing probe)
+  local iface="$1" addr
+  addr="$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+  [[ -n "$addr" ]] || { log "[ntm] probe: $iface has no IPv4 address"; return 1; }
+  [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" == "1" ]] || { log "[ntm] probe: ip_forward is off"; return 1; }
+  iptables -S FORWARD 2>/dev/null | grep -q -- "$iface" || { log "[ntm] probe: no FORWARD rule for $iface"; return 1; }
+  iptables -t nat -S POSTROUTING 2>/dev/null | grep -qi masquerade || { log "[ntm] probe: no nat MASQUERADE rule"; return 1; }
+  # end-to-end: a packet sourced from the tunnel IP must reach the internet (exercises FORWARD + MASQUERADE)
+  curl --interface "$addr" -fsS --max-time 10 -o /dev/null https://icanhazip.com 2>/dev/null && return 0
+  ping -c1 -W4 -I "$addr" 1.1.1.1 >/dev/null 2>&1 && return 0
+  log "[ntm] probe: no egress from $iface (src $addr) - forwarding/masquerade broken"; return 1
 }
 
 # Evaluate / apply tunnel rules after a nym-node release. Gateways only. NEVER aborts the run.
@@ -405,11 +412,15 @@ maybe_run_ntm() {
     log "[ntm] fetched NTM @ $tag (sha256 $(sha256sum "$tmp/ntm.sh" | awk '{print $1}'))"
 
     local healthy=1
-    if ntm_selftest "$tmp/ntm.sh"; then log "[ntm] self-test OK (tunnel passing traffic)"; else healthy=0; log "[ntm] self-test FAILED"; fi
+    if ntm_selftest "$iface"; then log "[ntm] pre-apply self-test OK (tunnel egressing)"; else healthy=0; log "[ntm] pre-apply self-test FAILED (tunnel not egressing)"; fi
 
     if (( mentioned == 0 && healthy == 1 )); then
       log "[ntm] nothing to do (no changelog mention, tunnel healthy)"; printf '%s\n' "$tag" > "$NTM_STATE"; rc=0; break
     fi
+
+    # snapshot the live firewall first so a bad apply can be reverted (upstream apply persists rules mid-run)
+    iptables-save  > "$tmp/v4.bak" 2>/dev/null || true
+    ip6tables-save > "$tmp/v6.bak" 2>/dev/null || true
 
     log "[ntm] applying tunnel rules (changelog_mentioned=$mentioned tunnel_healthy=$healthy)"
     ntm_run "$tmp/ntm.sh" adjust_ip_forwarding         || true
@@ -419,17 +430,28 @@ maybe_run_ntm() {
     ntm_run "$tmp/ntm.sh" remove_duplicate_rules "$iface" || true
     ip link show nymwg >/dev/null 2>&1 && { ntm_run "$tmp/ntm.sh" remove_duplicate_rules nymwg || true; }
 
-    if ntm_selftest "$tmp/ntm.sh"; then
+    if ntm_selftest "$iface"; then
       command -v netfilter-persistent >/dev/null 2>&1 && { netfilter-persistent save >/dev/null 2>&1 || true; }
       install -m 0755 "$tmp/ntm.sh" "$dest" 2>/dev/null || true
-      log "[ntm] SUCCESS: tunnel healthy after apply; rules persisted; NTM saved to $dest"
+      log "[ntm] SUCCESS: tunnel egressing after apply; rules persisted; NTM saved to $dest"
       notify success "NTM tunnel rules applied for $tag; tunnel healthy"
       printf '%s\n' "$tag" > "$NTM_STATE"; rc=0; break
     fi
-    log "[ntm] CRITICAL: tunnel still failing after apply for $tag - MANUAL CHECK NEEDED (firewall changes are not auto-rolled-back)."
-    notify failed "NTM apply for $tag did not restore the tunnel on this gateway; manual intervention needed"
-    printf '%s\n' "$tag" > "$NTM_STATE"   # record to avoid hourly firewall thrash; clear $NTM_STATE to retry
-    rc=1; break
+
+    # apply broke the tunnel -> revert the firewall to the pre-apply snapshot and re-persist
+    log "[ntm] post-apply self-test FAILED for $tag; REVERTING firewall to pre-apply snapshot"
+    [[ -s "$tmp/v4.bak" ]] && { iptables-restore  < "$tmp/v4.bak" 2>/dev/null || log "[ntm] WARN: iptables-restore failed"; }
+    [[ -s "$tmp/v6.bak" ]] && { ip6tables-restore < "$tmp/v6.bak" 2>/dev/null || log "[ntm] WARN: ip6tables-restore failed"; }
+    command -v netfilter-persistent >/dev/null 2>&1 && { netfilter-persistent save >/dev/null 2>&1 || true; }
+    printf '%s\n' "$tag" > "$NTM_STATE"   # record to avoid hourly thrash; clear $NTM_STATE to retry
+    if ntm_selftest "$iface"; then
+      log "[ntm] REVERT OK: firewall restored, tunnel egressing again. $tag recorded (clear $NTM_STATE to retry)."
+      notify rollback "NTM apply for $tag broke the tunnel; reverted firewall, tunnel is UP"
+      rc=1; break
+    fi
+    log "[ntm] CRITICAL: tunnel still failing after revert for $tag - MANUAL INTERVENTION NEEDED."
+    notify failed "CRITICAL: NTM apply for $tag broke the tunnel AND revert did not restore it on this gateway"
+    rc=2; break
   done
   rm -rf "$tmp"
   return "$rc"

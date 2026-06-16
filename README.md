@@ -23,10 +23,13 @@ releases it does nothing. It is designed to never leave a node down.
   never executes the changelog as instructions. If the section mentions tunnel / ports / firewall /
   wireguard (or if a tunnel self-test fails), it fetches the **tag-matched** NTM from `nymtech/nym`
   (`scripts/nym-node-setup/network-tunnel-manager.sh`), runs its own `apply_iptables_rules*` +
-  `remove_duplicate_rules` + self-test, then persists the rules with `netfilter-persistent`. Exit-policy
-  changes are only **logged, never auto-applied**. Unlike a binary swap, firewall changes are **not**
-  auto-rolled-back, so a failed apply raises a loud alert for manual follow-up. Detected via the
-  `nymtun0` interface.
+  `remove_duplicate_rules`, and gates the result on a **real egress probe** (a packet sourced from the
+  tunnel IP must reach the internet - this catches a broken FORWARD/MASQUERADE, unlike the upstream
+  check which always passes). Before applying it **snapshots the live firewall** (`iptables-save`), and
+  if the probe fails after apply it **reverts** to the snapshot and re-persists. Exit-policy changes are
+  only **logged, never auto-applied**. The NTM script ships no upstream checksum, so it is pinned to the
+  release tag, fetched over HTTPS, and its sha256 logged - the same trust model as fetching it by hand.
+  Detected via the `nymtun0` interface.
 
 The script detects the node's role automatically; you do not configure it per role.
 
