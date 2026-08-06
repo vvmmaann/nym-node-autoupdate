@@ -62,6 +62,12 @@ BACKUP_DIR="$STATE_DIR/backups"
 STATE_TAG="$STATE_DIR/last_tag";               FAILED_TAGS="$STATE_DIR/failed_tags"
 BRIDGE_STATE_TAG="$STATE_DIR/bridge_last_tag"; BRIDGE_FAILED_TAGS="$STATE_DIR/bridge_failed_tags"
 NTM_STATE="$STATE_DIR/ntm_last_tag"
+# operator-facing changelog (docs). the release git tag is cut BEFORE its docs section is written,
+# so the section is read from the docs branch, not the tag. official nym source, trusted.
+OP_CHANGELOG_PATH="documentation/docs/pages/operators/changelog.mdx"
+OP_CHANGELOG_REFS="${NYM_DOCS_REFS:-main develop}"
+ACTIONS_STATE="$STATE_DIR/actions_last_tag"
+CHANGELOG_ACTIONS="${NYM_CHANGELOG_ACTIONS:-1}"   # 1 = auto-run non-tunnel operator commands (deny-list enforced); 0 = report only
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
@@ -156,9 +162,23 @@ bin_version() {
   "$1" --version 2>/dev/null | grep -ioP 'build version:\s*\K[0-9][0-9.]*' | head -n1 || true
 }
 
+# systemctl wrapper that honors the service scope. A node run under `systemctl --user`
+# by a lingering user (e.g. a node kept off root) is driven as that user via runuser +
+# XDG_RUNTIME_DIR, so a root-run timer can still stop/start/health-check it. Anything not
+# user-scope (the default, and always the autoupdate timer itself) stays system-wide.
+sctl() {
+  if [[ "${SVC_SCOPE:-system}" == "user" && -n "${SVC_USER:-}" && "$SVC_USER" != "root" ]]; then
+    local uid; uid="$(id -u "$SVC_USER" 2>/dev/null)"
+    if [[ -z "$uid" ]]; then log "[sctl] cannot resolve uid for user '$SVC_USER'"; return 1; fi
+    runuser -u "$SVC_USER" -- env XDG_RUNTIME_DIR="/run/user/${uid}" systemctl --user "$@"
+  else
+    systemctl "$@"
+  fi
+}
+
 # Resolve everything from the saved config first, falling back to live detection.
 resolve_target() {
-  UNIT=""; BIN=""; SVC_USER=""; ROLE=""; BRIDGE_UNIT=""; BRIDGE_BIN=""; NTM_ENABLED=""; NTM_PATH=""; NTM_IFACE=""
+  UNIT=""; BIN=""; SVC_USER=""; ROLE=""; BRIDGE_UNIT=""; BRIDGE_BIN=""; NTM_ENABLED=""; NTM_PATH=""; NTM_IFACE=""; SVC_SCOPE=""
   if [[ -f "$CONFIG_FILE" ]]; then
     # only trust the config if it is root-owned and not group/other-writable (we source it as root)
     if [[ "$(stat -c '%U' "$CONFIG_FILE" 2>/dev/null || echo '?')" == "root" \
@@ -179,6 +199,7 @@ resolve_target() {
   [[ -n "${NTM_IFACE:-}" ]] || NTM_IFACE="nymtun0"
   [[ "$NTM_IFACE" =~ ^[a-zA-Z0-9._-]+$ ]] || NTM_IFACE="nymtun0"   # sanity: never let junk reach iptables/ip
   [[ -n "${NTM_PATH:-}" ]]  || NTM_PATH="/usr/local/sbin/network-tunnel-manager.sh"
+  [[ -n "${SVC_SCOPE:-}" ]] || SVC_SCOPE="system"
 }
 
 save_config() {
@@ -195,6 +216,7 @@ BRIDGE_BIN="$6"
 NTM_ENABLED="$7"
 NTM_PATH="$8"
 NTM_IFACE="$9"
+SVC_SCOPE="${10:-system}"
 EOF
   chmod 0644 "$CONFIG_FILE"
 }
@@ -255,11 +277,11 @@ is_blacklisted() {        # return 0 = skip this tag
 # (does NOT demand SubState=running or a live main PID, which false-fail healthy non-simple units).
 is_healthy() {
   local u="$1" b="$2" expect="${3:-}" a1 a2 t1 t2 rv
-  a1="$(systemctl is-active "$u" 2>/dev/null || true)"
-  t1="$(systemctl show -p ActiveEnterTimestampMonotonic --value "$u" 2>/dev/null || echo 0)"
+  a1="$(sctl is-active "$u" 2>/dev/null || true)"
+  t1="$(sctl show -p ActiveEnterTimestampMonotonic --value "$u" 2>/dev/null || echo 0)"
   sleep 8
-  a2="$(systemctl is-active "$u" 2>/dev/null || true)"
-  t2="$(systemctl show -p ActiveEnterTimestampMonotonic --value "$u" 2>/dev/null || echo 0)"
+  a2="$(sctl is-active "$u" 2>/dev/null || true)"
+  t2="$(sctl show -p ActiveEnterTimestampMonotonic --value "$u" 2>/dev/null || echo 0)"
   [[ "$a1" == "active" && "$a2" == "active" ]] || return 1
   [[ "$t1" == "$t2" ]] || return 1
   if [[ -n "$expect" ]]; then
@@ -350,15 +372,15 @@ update_component() {
     fi
 
     log "[$NAME] stopping $CUNIT"
-    systemctl stop "$CUNIT" || log "[$NAME] warning: stop returned non-zero"
+    sctl stop "$CUNIT" || log "[$NAME] warning: stop returned non-zero"
     if ! mv -f "$staged" "$CBIN"; then
       log "[$NAME] atomic swap failed; restoring previous binary"
       rm -f "$staged" 2>/dev/null || true
       cp -a "$backup" "$CBIN" 2>/dev/null || log "[$NAME] CRITICAL: restore after failed swap failed ($backup -> $CBIN)"
-      systemctl start "$CUNIT" || true; rc=1; break
+      sctl start "$CUNIT" || true; rc=1; break
     fi
     log "[$NAME] installed new binary; starting $CUNIT"
-    systemctl start "$CUNIT" || log "[$NAME] warning: start returned non-zero"
+    sctl start "$CUNIT" || log "[$NAME] warning: start returned non-zero"
 
     sleep "$HEALTH_WAIT"
     if is_healthy "$CUNIT" "$CBIN" "$newver"; then
@@ -371,11 +393,11 @@ update_component() {
 
     # rollback: restore the previous binary (atomically), record the failure, verify just as strictly
     log "[$NAME] HEALTH CHECK FAILED for $tag; ROLLING BACK to previous binary"
-    systemctl stop "$CUNIT" || true
+    sctl stop "$CUNIT" || true
     if cp -a "$backup" "$dir/.nau-rb.$$" 2>/dev/null && mv -f "$dir/.nau-rb.$$" "$CBIN" 2>/dev/null; then :; else
       log "[$NAME] CRITICAL: rollback restore failed ($backup -> $CBIN)"; rm -f "$dir/.nau-rb.$$" 2>/dev/null || true
     fi
-    systemctl start "$CUNIT" || true
+    sctl start "$CUNIT" || true
     record_fail "$CFAILED" "$tag"
     sleep "$HEALTH_WAIT"
     if is_healthy "$CUNIT" "$CBIN" "$curver"; then
@@ -392,20 +414,35 @@ update_component() {
 # ------------------- network tunnel manager (gateways only) -----------------
 # Scan ONLY this release's changelog section for tunnel/port relevance. arg: tag
 # stdout = matched lines; return 0 = relevant, 1 = not relevant, 2 = could not read/parse.
+# Print the operator-changelog section for a release version, e.g. "2026.15-bydgoszcz".
+# Docs headings look like:  ## `v2026.15-bydgoszcz`   (the leading char before v is a backtick,
+# matched here with '.'). Tries each docs branch in turn.
+op_changelog_section() {   # arg: version (tag minus TAG_PREFIX)
+  local ver="$1" ref cl section
+  for ref in $OP_CHANGELOG_REFS; do
+    cl="$(curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --retry 2 --max-time 60 \
+          "https://raw.githubusercontent.com/$REPO/$ref/$OP_CHANGELOG_PATH" 2>/dev/null)" \
+      || cl="$(curl -4 -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --retry 2 --max-time 60 \
+          "https://raw.githubusercontent.com/$REPO/$ref/$OP_CHANGELOG_PATH" 2>/dev/null)" || continue
+    section="$(printf '%s\n' "$cl" | awk -v pat="^## .v${ver}([^A-Za-z0-9]|$)" '
+      $0 ~ pat {f=1; print; next}
+      f && /^## .v20/ {exit}
+      f {print}')"
+    [[ -n "$section" ]] && { printf '%s\n' "$section"; return 0; }
+  done
+  return 1
+}
+
+# Scan the operator-changelog section for tunnel/firewall relevance. arg: tag
+# stdout = matched lines; return 0 = relevant, 1 = not relevant, 2 = could not read/parse.
 changelog_mentions_ntm() {
-  local tag="$1" cl ver section matched
-  cl="$(curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --retry 3 --max-time 45 "https://raw.githubusercontent.com/$REPO/$tag/CHANGELOG.md" 2>/dev/null)" \
-    || cl="$(curl -4 -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --retry 3 --max-time 45 "https://raw.githubusercontent.com/$REPO/$tag/CHANGELOG.md" 2>/dev/null)" \
-    || return 2
+  local tag="$1" ver section matched
   ver="${tag#${TAG_PREFIX}}"
-  section="$(printf '%s\n' "$cl" | awk -v hdr="## [$ver]" '
-    index($0, hdr)==1 {f=1; next}
-    f && /^## \[/ {exit}
-    f {print}')"
+  section="$(op_changelog_section "$ver")" || return 2
   [[ -n "$section" ]] || return 2
-  # high-precision signals only (generic words like "port"/"forwarding" caused false triggers,
-  # e.g. "Testing port checks in NS Agents"). The real egress probe is the primary safety net.
-  matched="$(printf '%s\n' "$section" | grep -iE 'network.?tunnel.?manager|nymtun|iptables|firewall|wireguard|open[^.]{0,20}\bports?\b|new[^.]{0,15}\bports?\b' || true)"
+  # operator-changelog is human-written and explicit, so we can key off its real vocabulary,
+  # including the exact commands it tells operators to run.
+  matched="$(printf '%s\n' "$section" | grep -iE 'network.?tunnel.?manager|(^|[^a-z])NTM([^a-z]|$)|complete_networking_configuration|nymtun|iptables|firewall|wireguard|re-?run[^.]{0,40}tunnel|(^|[^a-z])bands?([^a-z]|$)|bandwidth|open[^.]{0,20}\bports?\b' || true)"
   [[ -n "$matched" ]] || return 1
   printf '%s\n' "$matched"
 }
@@ -524,12 +561,88 @@ maybe_run_ntm() {
   return "$rc"
 }
 
+# ------------------- changelog-driven operator actions ----------------------
+# Pull runnable shell lines out of the fenced code blocks of a changelog section.
+# Only bash/sh/shell/console blocks; skip comments, blanks, and leading "$ " prompts.
+changelog_commands() {   # stdin: section text ; stdout: one command per line
+  awk '
+    /^[[:space:]]*```(bash|sh|shell|console)[[:space:]]*$/ { inb=1; next }
+    /^[[:space:]]*```/ { inb=0; next }
+    inb {
+      line=$0
+      sub(/^[[:space:]]+/,"",line); sub(/[[:space:]]+$/,"",line)
+      if (line=="" || line ~ /^#/) next
+      sub(/^\$[[:space:]]*/,"",line)
+      print line
+    }'
+}
+
+# Deny-list: refuse to auto-run anything that could destroy the node, wipe data, change the host
+# or its accounts, or fetch from a non-nym origin. Everything else from the official operator
+# changelog is allowed. return 0 = BLOCK, 1 = allow.
+changelog_cmd_blocked() {   # arg: command
+  local c="$1"
+  printf '%s' "$c" | grep -iqE 'unbond|undelegate|rm[[:space:]]+-[a-zA-Z]*[rf]|mkfs|\bdd[[:space:]]+if=|of=/dev/|shutdown|reboot|poweroff|\bhalt\b|init[[:space:]]+0|user(del|add|mod)|deluser|passwd|\bwipe\b|drop[[:space:]]+(table|database)|:\(\)[[:space:]]*\{|>[[:space:]]*/dev/|chmod[[:space:]]+-?R?[[:space:]]*777|chown[[:space:]]+-R|\.nym|nym-nodes|/etc/(passwd|shadow|sudoers)|\bdelete\b|--purge|remove' && return 0
+  if printf '%s' "$c" | grep -iqE 'curl|wget'; then
+    printf '%s' "$c" | grep -iqE '\|[[:space:]]*(sudo[[:space:]]+)?(bash|sh)\b' && return 0     # pipe-to-shell
+    local u host
+    for u in $(printf '%s' "$c" | grep -oE 'https?://[^"'"'"' )]+'); do
+      host="$(printf '%s' "$u" | sed -E 's#https?://([^/]+).*#\1#')"
+      case "$host" in
+        raw.githubusercontent.com|github.com|*.nymtech.net|nymtech.net|*.nym.com|nym.com) ;;
+        *) return 0 ;;
+      esac
+    done
+  fi
+  return 1
+}
+
+# Run the operator actions the official changelog lists for this release. Tunnel/firewall commands
+# are left to the snapshot-protected NTM path (maybe_run_ntm); other commands run only if they clear
+# the deny-list. Recorded per tag so it never repeats.
+apply_changelog_actions() {   # arg: tag
+  [[ "${CHANGELOG_ACTIONS:-1}" == "1" ]] || return 0
+  local tag="$1" ver section cmds
+  [[ -n "$tag" ]] || return 0
+  [[ "$(cat "$ACTIONS_STATE" 2>/dev/null || true)" != "$tag" ]] || return 0
+  ver="${tag#${TAG_PREFIX}}"
+  section="$(op_changelog_section "$ver")" || { log "[actions] no operator changelog section for $ver yet (docs lag); will retry next run"; return 0; }
+  cmds="$(printf '%s\n' "$section" | changelog_commands)"
+  if [[ -z "$cmds" ]]; then log "[actions] operator changelog for $ver lists no runnable commands"; printf '%s\n' "$tag" > "$ACTIONS_STATE"; return 0; fi
+
+  log "[actions] operator changelog for $ver lists commands; evaluating with deny-list enforced"
+  local c ran=0 blocked=0 deferred=0 skipped=0 first
+  while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
+    # code blocks also carry command OUTPUT and examples, which must never be eval'd:
+    if printf '%s' "$c" | grep -qE '<[A-Za-z0-9_.-]+>'; then log "[actions] skip (placeholder): $c"; skipped=$((skipped+1)); continue; fi     # e.g. HOST_SSH_PORT=<PORT>
+    if printf '%s' "$c" | grep -qE '^[A-Za-z][A-Za-z ]+:[[:space:]][[:space:]]+[^[:space:]]'; then skipped=$((skipped+1)); continue; fi         # "Build Version:   1.37.0" output
+    if changelog_cmd_blocked "$c"; then
+      log "[actions] BLOCKED (suspicious - manual review): $c"; notify failed "changelog action BLOCKED for $ver: $c"; blocked=$((blocked+1)); continue
+    fi
+    # tunnel/firewall work is done by the snapshot-protected NTM path, never eval'd here
+    if printf '%s' "$c" | grep -qiE 'network-tunnel-manager|nymtun|iptables|complete_networking_configuration'; then
+      [[ "${NTM_ENABLED:-0}" == "1" ]] && log "[actions] tunnel command handled by the NTM path: $c" || log "[actions] skip (not an exit gateway): $c"
+      deferred=$((deferred+1)); continue
+    fi
+    # only run if the first real token is an executable present on THIS host (drops examples for
+    # other setups, e.g. ansible-playbook, and any stray non-command lines)
+    first="$(printf '%s' "$c" | sed -E 's/^([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+)+//; s/[[:space:]].*//')"
+    case "$first" in nym-node|nym-bridge|nymvisor) log "[actions] skip (managed binary, updated separately): $c"; skipped=$((skipped+1)); continue;; esac
+    if [[ "$first" != ./* ]] && ! command -v "$first" >/dev/null 2>&1; then log "[actions] skip (command '$first' not on this host): $c"; skipped=$((skipped+1)); continue; fi
+    log "[actions] running: $c"
+    if ( eval "$c" ) >>"$LOGFILE" 2>&1; then ran=$((ran+1)); log "[actions] ok: $c"; else log "[actions] WARN non-zero exit: $c"; fi
+  done <<<"$cmds"
+  log "[actions] done for $ver (ran=$ran deferred=$deferred blocked=$blocked skipped=$skipped)"
+  printf '%s\n' "$tag" > "$ACTIONS_STATE"
+}
+
 # --------------------------------- run --------------------------------------
 cmd_run() {
   ensure_dirs
   resolve_target
   [[ -n "$UNIT" ]]                       || die "no nym-node systemd service found (run 'install' first)"
-  systemctl cat "$UNIT" >/dev/null 2>&1  || die "configured unit '$UNIT' not known to systemd"
+  sctl cat "$UNIT" >/dev/null 2>&1       || die "configured unit '$UNIT' not known to systemd (${SVC_SCOPE:-system} scope)"
   [[ -n "$BIN" && -x "$BIN" ]]           || die "could not locate the nym-node binary ('$BIN')"
   log "target: unit=$UNIT user=$SVC_USER bin=$BIN role=$ROLE"
 
@@ -547,6 +660,9 @@ cmd_run() {
   local ntm_rc=0
   maybe_run_ntm || ntm_rc=$?
 
+  # run any remaining operator actions the official changelog lists (non-tunnel; deny-list enforced)
+  apply_changelog_actions "$(cat "$STATE_TAG" 2>/dev/null || true)" || true
+
   log "run complete (nym-node rc=$node_rc, nym-bridge rc=$bridge_rc, ntm rc=$ntm_rc)"
   if (( node_rc != 0 || bridge_rc != 0 || ntm_rc != 0 )); then exit 1; fi
   exit 0
@@ -555,9 +671,22 @@ cmd_run() {
 # ------------------------------ install/remove ------------------------------
 cmd_install() {
   ensure_dirs
-  local unit bin svcuser role brunit brbin brver curver
+  local unit bin svcuser role brunit brbin brver curver svcscope
   unit="$(detect_unit)"; bin="$(detect_bin "$unit")"; svcuser="$(detect_user "$unit")"
   role="$(detect_role "$unit")"; curver="$(bin_version "${bin:-/bin/false}")"
+  # explicit overrides for setups system detection can't see, e.g. a node kept off root under
+  # `systemctl --user` by a lingering user:  NYM_SCOPE=user NYM_USER=<u> NYM_UNIT=<svc> NYM_BIN=<path>
+  svcscope="${NYM_SCOPE:-system}"
+  [[ -n "${NYM_UNIT:-}" ]] && unit="$NYM_UNIT"
+  [[ -n "${NYM_USER:-}" ]] && svcuser="$NYM_USER"
+  [[ -n "${NYM_BIN:-}"  ]] && bin="$NYM_BIN"
+  # point sctl at the right scope so the validation + version checks below hit the real service
+  SVC_SCOPE="$svcscope"; SVC_USER="${svcuser:-root}"
+  if [[ "$svcscope" == "user" ]]; then
+    [[ -n "${NYM_BIN:-}" ]] && curver="$(bin_version "${bin:-/bin/false}")"
+    local es; es="$(sctl show -p ExecStart --value "$unit" 2>/dev/null || true)"
+    case "$es" in *mixnode*) role="mixnode";; *exit-gateway*|*entry-gateway*) role="gateway";; *) role="${role:-node}";; esac
+  fi
   brunit="$(detect_bridge_unit)"; brbin=""; brver=""
   if [[ -n "$brunit" ]]; then brbin="$(detect_bridge_bin "$brunit")"; brver="$(dpkg-query -W -f='${Version}' nym-bridge 2>/dev/null || true)"; fi
   local ntm_en ntm_path ntm_iface
@@ -602,7 +731,7 @@ cmd_install() {
 
   # validate before committing anything
   [[ -n "$unit" ]] || die "no systemd unit set; aborting"
-  systemctl cat "$unit" >/dev/null 2>&1 || die "unit '$unit' not found by systemd; aborting"
+  sctl cat "$unit" >/dev/null 2>&1 || die "unit '$unit' not found in ${svcscope} scope; aborting"
   [[ -n "$bin" && -x "$bin" ]] || die "nym-node binary '$bin' missing or not executable; aborting"
   if [[ -n "$brunit" ]]; then
     systemctl cat "$brunit" >/dev/null 2>&1 || die "bridge unit '$brunit' not found by systemd; aborting"
@@ -610,8 +739,8 @@ cmd_install() {
   fi
   [[ "${ntm_iface:-nymtun0}" =~ ^[a-zA-Z0-9._-]+$ ]] || ntm_iface="nymtun0"
 
-  save_config "$unit" "$bin" "${svcuser:-root}" "$role" "$brunit" "$brbin" "${ntm_en:-0}" "$ntm_path" "${ntm_iface:-nymtun0}"
-  log "saved config -> $CONFIG_FILE (unit=$unit bin=$bin user=${svcuser:-root} bridge=${brunit:-none} ntm=${ntm_en:-0})"
+  save_config "$unit" "$bin" "${svcuser:-root}" "$role" "$brunit" "$brbin" "${ntm_en:-0}" "$ntm_path" "${ntm_iface:-nymtun0}" "$svcscope"
+  log "saved config -> $CONFIG_FILE (unit=$unit bin=$bin user=${svcuser:-root} scope=${svcscope} bridge=${brunit:-none} ntm=${ntm_en:-0})"
 
   install -m 0755 "$SELF_PATH" "$DEST_PATH"
   cat > /etc/systemd/system/nym-node-autoupdate.service <<UNIT
