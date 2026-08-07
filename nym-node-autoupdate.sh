@@ -158,6 +158,18 @@ detect_ntm() {            # echoes "<enabled>\t<path>\t<iface>"
   [[ -n "$path" ]] || path="/usr/local/sbin/network-tunnel-manager.sh"
   printf '%s\t%s\t%s\n' "$en" "$path" "$iface"
 }
+# Best-effort detection of the host SSH port, so an NTM firewall apply never locks the operator
+# out on a non-standard port. Prefers sshd's own effective config, then a listening sshd socket,
+# then 22. Overridable via NYM_SSH_PORT / the saved config.
+detect_ssh_port() {
+  local p=""
+  # sshd's effective config is authoritative; grab the first Port it actually listens on
+  p="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"
+  # fall back to grepping the active sshd config, then to the default
+  [[ "$p" =~ ^[0-9]+$ ]] || p="$(awk '/^[[:space:]]*[Pp]ort[[:space:]]+[0-9]+/{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)"
+  [[ "$p" =~ ^[0-9]+$ ]] || p=22
+  printf '%s\n' "$p"
+}
 bin_version() {
   "$1" --version 2>/dev/null | grep -ioP 'build version:\s*\K[0-9][0-9.]*' | head -n1 || true
 }
@@ -178,7 +190,7 @@ sctl() {
 
 # Resolve everything from the saved config first, falling back to live detection.
 resolve_target() {
-  UNIT=""; BIN=""; SVC_USER=""; ROLE=""; BRIDGE_UNIT=""; BRIDGE_BIN=""; NTM_ENABLED=""; NTM_PATH=""; NTM_IFACE=""; SVC_SCOPE=""
+  UNIT=""; BIN=""; SVC_USER=""; ROLE=""; BRIDGE_UNIT=""; BRIDGE_BIN=""; NTM_ENABLED=""; NTM_PATH=""; NTM_IFACE=""; SVC_SCOPE=""; SSH_PORT=""
   if [[ -f "$CONFIG_FILE" ]]; then
     # only trust the config if it is root-owned and not group/other-writable (we source it as root)
     if [[ "$(stat -c '%U' "$CONFIG_FILE" 2>/dev/null || echo '?')" == "root" \
@@ -200,6 +212,9 @@ resolve_target() {
   [[ "$NTM_IFACE" =~ ^[a-zA-Z0-9._-]+$ ]] || NTM_IFACE="nymtun0"   # sanity: never let junk reach iptables/ip
   [[ -n "${NTM_PATH:-}" ]]  || NTM_PATH="/usr/local/sbin/network-tunnel-manager.sh"
   [[ -n "${SVC_SCOPE:-}" ]] || SVC_SCOPE="system"
+  # SSH port for NTM's firewall (config > NYM_SSH_PORT env > live detection > 22)
+  [[ -n "${SSH_PORT:-}" ]] || SSH_PORT="${NYM_SSH_PORT:-$(detect_ssh_port)}"
+  [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || SSH_PORT=22
 }
 
 save_config() {
@@ -217,6 +232,7 @@ NTM_ENABLED="$7"
 NTM_PATH="$8"
 NTM_IFACE="$9"
 SVC_SCOPE="${10:-system}"
+SSH_PORT="${11:-}"
 EOF
   chmod 0644 "$CONFIG_FILE"
 }
@@ -526,6 +542,9 @@ maybe_run_ntm() {
     fi
 
     log "[ntm] applying tunnel rules (changelog_mentioned=$mentioned tunnel_healthy=$healthy)"
+    # tell NTM the real SSH port so its firewall never locks the operator out on a non-standard port
+    export HOST_SSH_PORT="${SSH_PORT:-22}"
+    log "[ntm] HOST_SSH_PORT=$HOST_SSH_PORT (firewall will keep this SSH port open)"
     ntm_run "$tmp/ntm.sh" adjust_ip_forwarding         || true
     ntm_run "$tmp/ntm.sh" apply_iptables_rules         || true
     ntm_run "$tmp/ntm.sh" apply_iptables_rules_wg      || true
@@ -739,8 +758,9 @@ cmd_install() {
   fi
   [[ "${ntm_iface:-nymtun0}" =~ ^[a-zA-Z0-9._-]+$ ]] || ntm_iface="nymtun0"
 
-  save_config "$unit" "$bin" "${svcuser:-root}" "$role" "$brunit" "$brbin" "${ntm_en:-0}" "$ntm_path" "${ntm_iface:-nymtun0}" "$svcscope"
-  log "saved config -> $CONFIG_FILE (unit=$unit bin=$bin user=${svcuser:-root} scope=${svcscope} bridge=${brunit:-none} ntm=${ntm_en:-0})"
+  local sshport="${NYM_SSH_PORT:-$(detect_ssh_port)}"; [[ "$sshport" =~ ^[0-9]+$ ]] || sshport=22
+  save_config "$unit" "$bin" "${svcuser:-root}" "$role" "$brunit" "$brbin" "${ntm_en:-0}" "$ntm_path" "${ntm_iface:-nymtun0}" "$svcscope" "$sshport"
+  log "saved config -> $CONFIG_FILE (unit=$unit bin=$bin user=${svcuser:-root} scope=${svcscope} bridge=${brunit:-none} ntm=${ntm_en:-0} ssh_port=${sshport})"
 
   install -m 0755 "$SELF_PATH" "$DEST_PATH"
   cat > /etc/systemd/system/nym-node-autoupdate.service <<UNIT
