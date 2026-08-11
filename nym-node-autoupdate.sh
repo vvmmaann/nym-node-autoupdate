@@ -627,63 +627,28 @@ changelog_commands() {   # stdin: section text ; stdout: one command per line
     }'
 }
 
-# Deny-list: refuse to auto-run anything that could destroy the node, wipe data, change the host
-# or its accounts, or fetch from a non-nym origin. Everything else from the official operator
-# changelog is allowed. return 0 = BLOCK, 1 = allow.
-changelog_cmd_blocked() {   # arg: command
-  local c="$1"
-  printf '%s' "$c" | grep -iqE 'unbond|undelegate|rm[[:space:]]+-[a-zA-Z]*[rf]|mkfs|\bdd[[:space:]]+if=|of=/dev/|shutdown|reboot|poweroff|\bhalt\b|init[[:space:]]+0|user(del|add|mod)|deluser|passwd|\bwipe\b|drop[[:space:]]+(table|database)|:\(\)[[:space:]]*\{|>[[:space:]]*/dev/|chmod[[:space:]]+-?R?[[:space:]]*777|chown[[:space:]]+-R|\.nym|nym-nodes|/etc/(passwd|shadow|sudoers)|\bdelete\b|--purge|remove' && return 0
-  if printf '%s' "$c" | grep -iqE 'curl|wget'; then
-    printf '%s' "$c" | grep -iqE '\|[[:space:]]*(sudo[[:space:]]+)?(bash|sh)\b' && return 0     # pipe-to-shell
-    local u host
-    for u in $(printf '%s' "$c" | grep -oE 'https?://[^"'"'"' )]+'); do
-      host="$(printf '%s' "$u" | sed -E 's#https?://([^/]+).*#\1#')"
-      case "$host" in
-        raw.githubusercontent.com|github.com|*.nymtech.net|nymtech.net|*.nym.com|nym.com) ;;
-        *) return 0 ;;
-      esac
-    done
-  fi
-  return 1
-}
-
-# Run the operator actions the official changelog lists for this release. Tunnel/firewall commands
-# are left to the snapshot-protected NTM path (maybe_run_ntm); other commands run only if they clear
-# the deny-list. Recorded per tag so it never repeats.
-apply_changelog_actions() {   # arg: tag
-  [[ "${CHANGELOG_ACTIONS:-1}" == "1" ]] || return 0
+# Report (NEVER execute) the operator commands the official changelog lists for a release.
+# Auto-eval of network-fetched changelog content was a root-RCE risk, so it is removed entirely:
+# tunnel/firewall work still goes through the snapshot-protected NTM path (maybe_run_ntm); any other
+# listed commands are only surfaced to the operator to review and run by hand. Recorded per tag.
+apply_changelog_actions() {   # arg: tag  -- notify-only, does NOT run anything
   local tag="$1" ver section cmds
   [[ -n "$tag" ]] || return 0
   [[ "$(cat "$ACTIONS_STATE" 2>/dev/null || true)" != "$tag" ]] || return 0
   ver="${tag#${TAG_PREFIX}}"
   section="$(op_changelog_section "$ver")" || { log "[actions] no operator changelog section for $ver yet (docs lag); will retry next run"; return 0; }
   cmds="$(printf '%s\n' "$section" | changelog_commands)"
-  if [[ -z "$cmds" ]]; then log "[actions] operator changelog for $ver lists no runnable commands"; printf '%s\n' "$tag" > "$ACTIONS_STATE"; return 0; fi
+  if [[ -z "$cmds" ]]; then printf '%s\n' "$tag" > "$ACTIONS_STATE"; return 0; fi
 
-  log "[actions] operator changelog for $ver lists commands; evaluating with deny-list enforced"
-  local c ran=0 blocked=0 deferred=0 skipped=0 first
+  local c n=0
   while IFS= read -r c; do
     [[ -n "$c" ]] || continue
-    # code blocks also carry command OUTPUT and examples, which must never be eval'd:
-    if printf '%s' "$c" | grep -qE '<[A-Za-z0-9_.-]+>'; then log "[actions] skip (placeholder): $c"; skipped=$((skipped+1)); continue; fi     # e.g. HOST_SSH_PORT=<PORT>
-    if printf '%s' "$c" | grep -qE '^[A-Za-z][A-Za-z ]+:[[:space:]][[:space:]]+[^[:space:]]'; then skipped=$((skipped+1)); continue; fi         # "Build Version:   1.37.0" output
-    if changelog_cmd_blocked "$c"; then
-      log "[actions] BLOCKED (suspicious - manual review): $c"; notify failed "changelog action BLOCKED for $ver: $c"; blocked=$((blocked+1)); continue
-    fi
-    # tunnel/firewall work is done by the snapshot-protected NTM path, never eval'd here
-    if printf '%s' "$c" | grep -qiE 'network-tunnel-manager|nymtun|iptables|complete_networking_configuration'; then
-      [[ "${NTM_ENABLED:-0}" == "1" ]] && log "[actions] tunnel command handled by the NTM path: $c" || log "[actions] skip (not an exit gateway): $c"
-      deferred=$((deferred+1)); continue
-    fi
-    # only run if the first real token is an executable present on THIS host (drops examples for
-    # other setups, e.g. ansible-playbook, and any stray non-command lines)
-    first="$(printf '%s' "$c" | sed -E 's/^([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+)+//; s/[[:space:]].*//')"
-    case "$first" in nym-node|nym-bridge|nymvisor) log "[actions] skip (managed binary, updated separately): $c"; skipped=$((skipped+1)); continue;; esac
-    if [[ "$first" != ./* ]] && ! command -v "$first" >/dev/null 2>&1; then log "[actions] skip (command '$first' not on this host): $c"; skipped=$((skipped+1)); continue; fi
-    log "[actions] running: $c"
-    if ( eval "$c" ) >>"$LOGFILE" 2>&1; then ran=$((ran+1)); log "[actions] ok: $c"; else log "[actions] WARN non-zero exit: $c"; fi
+    # tunnel/firewall commands are handled safely by the NTM path; don't surface those as "manual"
+    if printf '%s' "$c" | grep -qiE 'network-tunnel-manager|nymtun|iptables|complete_networking_configuration'; then continue; fi
+    if [[ "$n" -eq 0 ]]; then log "[actions] operator changelog for $ver suggests manual commands (NOT auto-run):"; fi
+    log "[actions]   > $c"; n=$((n+1))
   done <<<"$cmds"
-  log "[actions] done for $ver (ran=$ran deferred=$deferred blocked=$blocked skipped=$skipped)"
+  [[ "$n" -gt 0 ]] && notify failed "Nym $ver changelog lists $n operator command(s) to review and run by hand (see the updater log). I never run these automatically."
   printf '%s\n' "$tag" > "$ACTIONS_STATE"
 }
 
