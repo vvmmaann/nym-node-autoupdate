@@ -67,16 +67,16 @@ NTM_STATE="$STATE_DIR/ntm_last_tag"
 OP_CHANGELOG_PATH="documentation/docs/pages/operators/changelog.mdx"
 OP_CHANGELOG_REFS="${NYM_DOCS_REFS:-main develop}"
 ACTIONS_STATE="$STATE_DIR/actions_last_tag"
-CHANGELOG_ACTIONS="${NYM_CHANGELOG_ACTIONS:-1}"   # 1 = auto-run non-tunnel operator commands (deny-list enforced); 0 = report only
+CHANGELOG_ACTIONS="${NYM_CHANGELOG_ACTIONS:-0}"   # 0 = report only (SAFE DEFAULT). Was 1; auto-eval of commands pulled from a mutable docs branch is a root-RCE risk (deny-list is bypassable), so it is OFF unless explicitly opted in.
 
 # Optional Telegram alerts. Both must be set (in the config, or via these env vars at install) to
 # enable; empty = alerts stay off. The config, which stores them, is written 0600 (root-only).
 TELEGRAM_BOT_TOKEN="${NYM_TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${NYM_TELEGRAM_CHAT_ID:-}"
 
-# Nymi (shared Telegram bot) registration endpoint. The node never holds a bot
-# token - it just tells the hub "this node belongs to @nick"; the hub links it.
-NYMI_HUB_URL="${NYM_NYMI_HUB_URL:-https://nymcheckby.unclelem.uk/nymi/link}"
+# Nymi (shared Telegram bot) endpoints. The node never holds a bot token - it
+# tells the hub "this node belongs to @nick" and asks "was I asked to update?".
+NYMI_HUB_BASE="${NYM_NYMI_HUB:-https://nymcheckby.unclelem.uk/nymi}"
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
@@ -931,8 +931,10 @@ cmd_link() {   # link this node to a Telegram operator on Nymi, by their @nick
   fi
   [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
     die "could not auto-detect this node's IP; run: $0 link @$nick <node_ip>"
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  printf '%s' "$ip" > "$STATE_DIR/nymi_node_ip" 2>/dev/null || true   # for the poll
   local resp
-  resp="$(curl -s --max-time 12 -X POST "$NYMI_HUB_URL" \
+  resp="$(curl -s --max-time 12 -X POST "$NYMI_HUB_BASE/link" \
             --data-urlencode "nick=$nick" --data-urlencode "ip=$ip" \
             --data-urlencode "updater=1" 2>/dev/null || true)"
   case "$resp" in
