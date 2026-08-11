@@ -827,6 +827,33 @@ UNIT
   systemctl daemon-reload
   systemctl enable --now nym-node-autoupdate.timer
   log "installed + enabled systemd timer (hourly, up to 20min jitter, catches missed runs after downtime)"
+
+  # frequent, lightweight poll so the bot's "update now" reaches this node fast
+  cat > /etc/systemd/system/nym-node-autoupdate-poll.service <<UNIT
+[Unit]
+Description=nym-node auto-updater: Nymi force-update poll
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$DEST_PATH poll
+UNIT
+  cat > /etc/systemd/system/nym-node-autoupdate-poll.timer <<UNIT
+[Unit]
+Description=Poll Nymi for on-demand update requests
+
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=45
+AccuracySec=10
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now nym-node-autoupdate-poll.timer
+  log "installed + enabled Nymi force-update poll timer (every ~45s)"
   systemctl list-timers nym-node-autoupdate.timer --no-pager 2>/dev/null || true
   echo
   echo "Done. It checks hourly and updates only when a new stable release appears."
@@ -854,9 +881,11 @@ UNIT
 
 cmd_uninstall() {
   systemctl disable --now nym-node-autoupdate.timer 2>/dev/null || true
-  rm -f /etc/systemd/system/nym-node-autoupdate.timer /etc/systemd/system/nym-node-autoupdate.service
+  systemctl disable --now nym-node-autoupdate-poll.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/nym-node-autoupdate.timer /etc/systemd/system/nym-node-autoupdate.service \
+        /etc/systemd/system/nym-node-autoupdate-poll.timer /etc/systemd/system/nym-node-autoupdate-poll.service
   systemctl daemon-reload || true
-  log "removed timer + service unit (config, state and binaries left intact)"
+  log "removed timers + service units (config, state and binaries left intact)"
 }
 
 cmd_check() {             # read-only: report whether newer releases exist (no changes, no root)
@@ -921,6 +950,16 @@ cmd_status() {
   fi
 }
 
+nymi_secret() {   # per-node secret proving THIS node to the hub (0600, generated once)
+  local f="$STATE_DIR/nymi_secret"
+  if [[ ! -s "$f" ]]; then
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    ( umask 077; head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32 > "$f" )
+    chmod 600 "$f" 2>/dev/null || true
+  fi
+  cat "$f" 2>/dev/null
+}
+
 cmd_link() {   # link this node to a Telegram operator on Nymi, by their @nick
   local nick="${1:-}" ip="${2:-}"
   nick="${nick#@}"
@@ -933,20 +972,48 @@ cmd_link() {   # link this node to a Telegram operator on Nymi, by their @nick
     die "could not auto-detect this node's IP; run: $0 link @$nick <node_ip>"
   mkdir -p "$STATE_DIR" 2>/dev/null || true
   printf '%s' "$ip" > "$STATE_DIR/nymi_node_ip" 2>/dev/null || true   # for the poll
-  local resp
-  resp="$(curl -s --max-time 12 -X POST "$NYMI_HUB_BASE/link" \
+  local resp secret; secret="$(nymi_secret)"
+  resp="$(curl -s --max-time 12 --proto '=https' --proto-redir '=https' -X POST "$NYMI_HUB_BASE/link" \
             --data-urlencode "nick=$nick" --data-urlencode "ip=$ip" \
-            --data-urlencode "updater=1" 2>/dev/null || true)"
+            --data-urlencode "updater=1" --data-urlencode "secret=$secret" 2>/dev/null || true)"
   case "$resp" in
     *'"linked"'*)
       echo "Linked node $ip to @$nick on Nymi - you should see it in the bot now." ;;
     *'"pending"'*)
       echo "Registered node $ip for @$nick."
       echo "Now open  https://t.me/nyminodebot  and press Start - it links the instant you do." ;;
+    *different?secret*|*'"error"'*)
+      echo "Nymi refused: ${resp:-<none>}"
+      echo "This node may already be linked with a different secret (a prior install)." ;;
     *)
       echo "Sent to Nymi, but the reply was unexpected: ${resp:-<none>}"
       echo "Open https://t.me/nyminodebot, press Start, then retry: $0 link @$nick" ;;
   esac
+}
+
+cmd_poll() {   # frequent timer: did the operator press "update now" in the bot?
+  local ip resp secret cache="$STATE_DIR/nymi_node_ip"
+  secret="$(nymi_secret)"; [[ -n "$secret" ]] || return 0
+  ip="$(cat "$cache" 2>/dev/null || true)"
+  if [[ ! "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    ip="$(curl -4 -s --max-time 6 https://api.ipify.org 2>/dev/null || true)"
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && { mkdir -p "$STATE_DIR" 2>/dev/null; printf '%s' "$ip" > "$cache"; }
+  fi
+  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 0
+  resp="$(curl -s --max-time 8 --proto '=https' --proto-redir '=https' \
+            "$NYMI_HUB_BASE/poll?ip=$ip&secret=$secret" 2>/dev/null || true)"
+  printf '%s' "$resp" | grep -qE '"run"[[:space:]]*:[[:space:]]*true' || return 0
+  log "[nymi] force-update requested from the bot; running now"
+  resolve_target
+  local before after outcome
+  before="$(bin_version "${BIN:-/bin/false}" 2>/dev/null || echo '')"
+  ( exec 9>"$LOCKFILE"; flock -n 9 && cmd_run ) || true
+  after="$(bin_version "${BIN:-/bin/false}" 2>/dev/null || echo '')"
+  if [[ -n "$after" && "$after" != "$before" ]]; then outcome="updated"; else outcome="noreleases"; fi
+  curl -s --max-time 10 --proto '=https' --proto-redir '=https' -X POST "$NYMI_HUB_BASE/result" \
+    --data-urlencode "ip=$ip" --data-urlencode "secret=$secret" \
+    --data-urlencode "outcome=$outcome" --data-urlencode "version=${after:-}" >/dev/null 2>&1 || true
+  log "[nymi] force-update result: $outcome ${after:-}"
 }
 
 # --------------------------------- dispatch ---------------------------------
@@ -964,7 +1031,8 @@ main() {
     check)     require_cmds curl jq; cmd_check ;;
     status)    cmd_status ;;
     link)      require_cmds curl; cmd_link "${2:-}" "${3:-}" ;;
-    *) echo "usage: $0 {install|run|check|status|link|uninstall}"; exit 1 ;;
+    poll)      need_root "$@"; require_cmds curl jq sha256sum flock; cmd_poll ;;
+    *) echo "usage: $0 {install|run|check|status|link|poll|uninstall}"; exit 1 ;;
   esac
 }
 main "$@"
