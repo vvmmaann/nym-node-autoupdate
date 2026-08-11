@@ -1001,7 +1001,8 @@ cmd_poll() {   # frequent timer: did the operator press "update now" in the bot?
   fi
   [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 0
   resp="$(curl -s --max-time 8 --proto '=https' --proto-redir '=https' \
-            "$NYMI_HUB_BASE/poll?ip=$ip&secret=$secret" 2>/dev/null || true)"
+            -H "Authorization: Bearer $secret" \
+            "$NYMI_HUB_BASE/poll?ip=$ip" 2>/dev/null || true)"
   printf '%s' "$resp" | grep -qE '"run"[[:space:]]*:[[:space:]]*true' || return 0
   log "[nymi] force-update requested from the bot; running now"
   resolve_target
