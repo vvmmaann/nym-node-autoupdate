@@ -69,6 +69,15 @@ OP_CHANGELOG_REFS="${NYM_DOCS_REFS:-main develop}"
 ACTIONS_STATE="$STATE_DIR/actions_last_tag"
 CHANGELOG_ACTIONS="${NYM_CHANGELOG_ACTIONS:-1}"   # 1 = auto-run non-tunnel operator commands (deny-list enforced); 0 = report only
 
+# Optional Telegram alerts. Both must be set (in the config, or via these env vars at install) to
+# enable; empty = alerts stay off. The config, which stores them, is written 0600 (root-only).
+TELEGRAM_BOT_TOKEN="${NYM_TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_CHAT_ID="${NYM_TELEGRAM_CHAT_ID:-}"
+
+# Nymi (shared Telegram bot) registration endpoint. The node never holds a bot
+# token - it just tells the hub "this node belongs to @nick"; the hub links it.
+NYMI_HUB_URL="${NYM_NYMI_HUB_URL:-https://nymcheckby.unclelem.uk/nymi/link}"
+
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
 
@@ -81,10 +90,29 @@ log() {
 }
 die() { log "ERROR: $*"; exit 1; }
 
-# Optional alerting hook. Called as: notify <success|rollback|failed> <message>.
-# No-op by default. NOTE: $2 may contain GitHub-controlled tag text - always quote it and pass via
-# --data-urlencode; never build a shell command out of it.
-notify() { :; }
+# Alerting hook, sent as "Nymi", the little creature that watches the node.
+# Called as: notify <success|rollback|failed> <message>. Off unless TELEGRAM_BOT_TOKEN + _CHAT_ID
+# are set. NOTE: $2 may contain GitHub-controlled tag text - it is only ever passed via
+# --data-urlencode, never built into a shell command.
+notify() {
+  local kind="${1:-info}" msg="${2:-}"
+  [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] || return 0
+  local emoji host text
+  case "$kind" in
+    success)  emoji="$(printf '\xf0\x9f\x90\xbe')" ;;   # paw prints
+    rollback) emoji="$(printf '\xf0\x9f\x9b\xa1')" ;;   # shield
+    failed)   emoji="$(printf '\xe2\x9a\xa0')" ;;       # warning sign
+    *)        emoji="$(printf '\xf0\x9f\x90\xbe')" ;;
+  esac
+  host="$(hostname 2>/dev/null || echo node)"
+  printf -v text '%s Nymi on %s\n%s' "$emoji" "$host" "$msg"
+  # fire-and-forget: a failed alert must never affect the update itself
+  gcurl -sS -m 15 -o /dev/null \
+    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+    --data-urlencode "text=${text}" \
+    2>/dev/null || log "[notify] telegram send failed (non-fatal)"
+}
 
 ensure_dirs() {
   mkdir -p "$STATE_DIR" "$BACKUP_DIR"
@@ -233,8 +261,11 @@ NTM_PATH="$8"
 NTM_IFACE="$9"
 SVC_SCOPE="${10:-system}"
 SSH_PORT="${11:-}"
+# Telegram alerts (optional). Both empty = alerts off. This file is root-only (0600) because of them.
+TELEGRAM_BOT_TOKEN="${12:-}"
+TELEGRAM_CHAT_ID="${13:-}"
 EOF
-  chmod 0644 "$CONFIG_FILE"
+  chmod 0600 "$CONFIG_FILE"
 }
 
 # ------------------------------- github lookup ------------------------------
@@ -759,8 +790,16 @@ cmd_install() {
   [[ "${ntm_iface:-nymtun0}" =~ ^[a-zA-Z0-9._-]+$ ]] || ntm_iface="nymtun0"
 
   local sshport="${NYM_SSH_PORT:-$(detect_ssh_port)}"; [[ "$sshport" =~ ^[0-9]+$ ]] || sshport=22
-  save_config "$unit" "$bin" "${svcuser:-root}" "$role" "$brunit" "$brbin" "${ntm_en:-0}" "$ntm_path" "${ntm_iface:-nymtun0}" "$svcscope" "$sshport"
-  log "saved config -> $CONFIG_FILE (unit=$unit bin=$bin user=${svcuser:-root} scope=${svcscope} bridge=${brunit:-none} ntm=${ntm_en:-0} ssh_port=${sshport})"
+  # Telegram alerts: prefer env, else preserve whatever is already saved (so re-install keeps them).
+  local tg_token="${NYM_TELEGRAM_BOT_TOKEN:-}" tg_chat="${NYM_TELEGRAM_CHAT_ID:-}"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    [[ -n "$tg_token" ]] || tg_token="$(sed -n 's/^TELEGRAM_BOT_TOKEN="\(.*\)"$/\1/p' "$CONFIG_FILE" | head -n1)"
+    [[ -n "$tg_chat"  ]] || tg_chat="$(sed -n 's/^TELEGRAM_CHAT_ID="\(.*\)"$/\1/p'  "$CONFIG_FILE" | head -n1)"
+  fi
+  save_config "$unit" "$bin" "${svcuser:-root}" "$role" "$brunit" "$brbin" "${ntm_en:-0}" "$ntm_path" "${ntm_iface:-nymtun0}" "$svcscope" "$sshport" "$tg_token" "$tg_chat"
+  local tg_state=off; [[ -n "$tg_token" && -n "$tg_chat" ]] && tg_state=on
+  log "saved config -> $CONFIG_FILE (unit=$unit bin=$bin user=${svcuser:-root} scope=${svcscope} bridge=${brunit:-none} ntm=${ntm_en:-0} ssh_port=${sshport} telegram=${tg_state})"
+  TELEGRAM_BOT_TOKEN="$tg_token"; TELEGRAM_CHAT_ID="$tg_chat"
 
   install -m 0755 "$SELF_PATH" "$DEST_PATH"
   cat > /etc/systemd/system/nym-node-autoupdate.service <<UNIT
@@ -792,6 +831,19 @@ UNIT
   echo
   echo "Done. It checks hourly and updates only when a new stable release appears."
   echo "Re-run '$DEST_PATH install' to change settings, or edit $CONFIG_FILE."
+  notify success "now watching this node (${role}). I'll ping you on updates, rollbacks, or anything that needs you."
+
+  # Register this node with Nymi (the shared Telegram bot) so its operator gets alerts.
+  if [[ "${NYM_ASSUME_YES:-0}" != "1" && -t 0 ]]; then
+    local tgnick
+    read -rp "Your Telegram @nick for Nymi alerts (blank to skip): " tgnick
+    if [[ -n "$tgnick" ]]; then
+      cmd_link "$tgnick" || true
+      echo ">>> Open https://t.me/nyminodebot and press Start to activate Nymi."
+    fi
+  elif [[ -n "${NYM_NYMI_NICK:-}" ]]; then
+    cmd_link "$NYM_NYMI_NICK" || true
+  fi
 
   if [[ "${NYM_ASSUME_YES:-0}" != "1" && -t 0 ]]; then
     local now
@@ -869,6 +921,32 @@ cmd_status() {
   fi
 }
 
+cmd_link() {   # link this node to a Telegram operator on Nymi, by their @nick
+  local nick="${1:-}" ip="${2:-}"
+  nick="${nick#@}"
+  [[ -n "$nick" ]] || die "usage: $0 link @your_telegram_nick [node_ip]"
+  if [[ -z "$ip" ]]; then
+    ip="$(curl -4 -s --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+    [[ "$ip" =~ ^[0-9.]+$ ]] || ip="$(curl -4 -s --max-time 8 https://ifconfig.me 2>/dev/null || true)"
+  fi
+  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
+    die "could not auto-detect this node's IP; run: $0 link @$nick <node_ip>"
+  local resp
+  resp="$(curl -s --max-time 12 -X POST "$NYMI_HUB_URL" \
+            --data-urlencode "nick=$nick" --data-urlencode "ip=$ip" \
+            --data-urlencode "updater=1" 2>/dev/null || true)"
+  case "$resp" in
+    *'"linked"'*)
+      echo "Linked node $ip to @$nick on Nymi - you should see it in the bot now." ;;
+    *'"pending"'*)
+      echo "Registered node $ip for @$nick."
+      echo "Now open  https://t.me/nyminodebot  and press Start - it links the instant you do." ;;
+    *)
+      echo "Sent to Nymi, but the reply was unexpected: ${resp:-<none>}"
+      echo "Open https://t.me/nyminodebot, press Start, then retry: $0 link @$nick" ;;
+  esac
+}
+
 # --------------------------------- dispatch ---------------------------------
 main() {
   local cmd="${1:-install}"
@@ -883,7 +961,8 @@ main() {
     uninstall) need_root "$@"; cmd_uninstall ;;
     check)     require_cmds curl jq; cmd_check ;;
     status)    cmd_status ;;
-    *) echo "usage: $0 {install|run|check|status|uninstall}"; exit 1 ;;
+    link)      require_cmds curl; cmd_link "${2:-}" "${3:-}" ;;
+    *) echo "usage: $0 {install|run|check|status|link|uninstall}"; exit 1 ;;
   esac
 }
 main "$@"
