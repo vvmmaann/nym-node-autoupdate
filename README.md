@@ -1,11 +1,17 @@
 # nym-node-autoupdate
 
+<img align="right" width="120" src="docs/nymi.png" alt="Nymi">
+
 A small, self-contained, **safe**, role-aware auto-updater for a Nym node under systemd.
 
 It fires on a schedule (a systemd timer, hourly by default) and keeps the node current. For each
 component, if a new stable release exists it downloads it, verifies it, swaps the binary, restarts
 the service, and **rolls back automatically if the service does not come back healthy**. Between
 releases it does nothing. It is designed to never leave a node down.
+
+It also pairs with **Nymi**, a Telegram bot that pings you when your node updates, when a release
+drops, when stake or stress moves, or when a node goes offline - and lets you force an update on
+demand. See [Nymi (Telegram alerts)](#nymi-telegram-alerts) below. **The node never holds a bot token.**
 
 ## What it updates
 
@@ -119,11 +125,36 @@ Force an update check **and apply** right now (this is what the hourly timer run
 sudo /usr/local/sbin/nym-node-autoupdate.sh run
 ```
 
-Remove the schedule (leaves your binary and state untouched):
+Remove the schedule - both the update timer and the Nymi poll timer (leaves your binary and state untouched):
 
 ```bash
 sudo /usr/local/sbin/nym-node-autoupdate.sh uninstall
 ```
+
+## Nymi (Telegram alerts)
+
+[**Nymi**](https://t.me/nyminodebot) is a companion Telegram bot that turns this updater into something
+you watch from your phone. Link a node and Nymi tells you the moment it updates, rolls back, or goes
+offline, plus release / stake / stress alerts and an on-demand `/status`. It also gives you a
+`/update` button that force-updates the node **right now** instead of waiting for the hourly timer.
+Most of its data comes from the [Nym node checker](https://nymcheckby.unclelem.uk), so Nymi is useful
+even on nodes that don't run this updater. Full writeup:
+[forum post](https://forum.nym.com/t/nymi-my-auto-updater-my-checker-and-a-3-year-old-mascot-walk-into-a-telegram-bot/2532).
+
+Link this node to your Telegram (fresh installs also ask for your `@nick` at the end and do this for you):
+
+```bash
+sudo /usr/local/sbin/nym-node-autoupdate.sh link @yourtelegram
+```
+
+then open [@nyminodebot](https://t.me/nyminodebot) and press **Start** - it links the instant you do.
+
+**How it stays safe.** The node **never holds the bot token.** On first link it generates its own
+per-node secret (`/var/lib/nym-autoupdate/nymi_secret`, `0600`) and authenticates to the hub with it,
+so only your node can drive its own `/update` or report a result - a stranger who knows your node's
+public IP cannot. A lightweight ~45s timer (`nym-node-autoupdate-poll.timer`) is what lets the
+`/update` button reach the node quickly; it only ever runs the same update the hourly timer would, and
+nothing is ever pushed into your node - the node checks in and pulls the request itself.
 
 ## Configuration (environment variables)
 
@@ -133,6 +164,8 @@ sudo /usr/local/sbin/nym-node-autoupdate.sh uninstall
 | `NYM_HEALTH_WAIT`    | `25`    | Seconds to wait after restart before the health check.        |
 | `NYM_KEEP_BACKUPS`   | `3`     | How many previous binaries to keep.                           |
 | `NYM_ASSUME_YES`     | `0`     | `1` skips the interactive confirmation (for batch installs).  |
+| `NYM_NYMI_NICK`      | -       | Telegram `@nick` to link this node to Nymi during a batch install. |
+| `NYM_NYMI_HUB`       | `https://nymcheckby.unclelem.uk/nymi` | Nymi hub endpoint base (advanced; leave as-is). |
 
 ## State and logs
 
