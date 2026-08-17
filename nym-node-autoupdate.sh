@@ -33,6 +33,8 @@
 #   nym-node-autoupdate.sh check      # read-only: report whether newer releases exist (installs nothing)
 #   nym-node-autoupdate.sh status     # print detected/configured setup and last known state
 #   nym-node-autoupdate.sh pair @nick # make this node yours on Nymi (run it ON the node; proves ownership by source IP)
+#   nym-node-autoupdate.sh self-update# update THIS script to the latest from GitHub (verifies + backs up first)
+#   nym-node-autoupdate.sh version    # print the script version
 #   nym-node-autoupdate.sh uninstall  # remove the timer (leaves config, state and binaries alone)
 #
 set -euo pipefail
@@ -82,6 +84,8 @@ NYMI_HUB_BASE="${NYM_NYMI_HUB:-https://nymcheckby.unclelem.uk/nymi}"
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
+SCRIPT_VERSION="1.1.0"
+SELF_UPDATE_URL="${NYM_SELF_UPDATE_URL:-https://raw.githubusercontent.com/vvmmaann/nym-node-autoupdate/main/nym-node-autoupdate.sh}"
 
 # --------------------------------- logging ----------------------------------
 log() {
@@ -851,6 +855,35 @@ UNIT
   fi
 }
 
+# Update THIS script from GitHub. Manual + safe: it fetches over HTTPS, checks the
+# download is really this script and parses cleanly (bash -n) BEFORE replacing itself,
+# keeps a timestamped backup, and no-ops if already current. Run it whenever you like.
+cmd_self_update() {
+  need_root "$@"
+  require_cmds curl
+  local tmp; tmp="$(mktemp)" || die "mktemp failed"
+  log "[self-update] fetching the latest script from GitHub..."
+  gcurl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --retry 3 \
+        --retry-delay 3 --max-time 60 -o "$tmp" "$SELF_UPDATE_URL" \
+    || { rm -f "$tmp"; die "download failed (network?)"; }
+  head -n1 "$tmp" | grep -q '^#!/usr/bin/env bash' \
+    || { rm -f "$tmp"; die "downloaded file is not a bash script; refusing to install"; }
+  grep -q 'nym-node-autoupdate' "$tmp" \
+    || { rm -f "$tmp"; die "downloaded file does not look like this updater; refusing to install"; }
+  bash -n "$tmp" \
+    || { rm -f "$tmp"; die "downloaded script failed a syntax check; NOT installing"; }
+  local newver; newver="$(grep -m1 '^SCRIPT_VERSION=' "$tmp" | cut -d'"' -f2)"
+  local dst="$DEST_PATH"; [[ -e "$dst" ]] || dst="$SELF_PATH"
+  if cmp -s "$tmp" "$dst" 2>/dev/null; then
+    log "[self-update] already on the latest (${newver:-$SCRIPT_VERSION}); nothing to do"; rm -f "$tmp"; return 0
+  fi
+  cp -a "$dst" "$dst.bak.$(date -u '+%Y%m%dT%H%M%SZ')" 2>/dev/null || true
+  install -m 0755 "$tmp" "$dst" || { rm -f "$tmp"; die "install to $dst failed"; }
+  rm -f "$tmp"
+  log "[self-update] updated $dst: $SCRIPT_VERSION -> ${newver:-latest}"
+  echo "Updated to ${newver:-latest}. The hourly timer keeps using it from here - nothing else to run."
+}
+
 cmd_uninstall() {
   systemctl disable --now nym-node-autoupdate.timer 2>/dev/null || true
   systemctl disable --now nym-node-autoupdate-poll.timer 2>/dev/null || true
@@ -894,6 +927,7 @@ cmd_check() {             # read-only: report whether newer releases exist (no c
 
 cmd_status() {
   resolve_target
+  echo "updater ver   : ${SCRIPT_VERSION}  (self-update: $0 self-update)"
   echo "nym-node unit : ${UNIT:-<none found>}"
   echo "user          : ${SVC_USER:-root}"
   echo "nym-node bin  : ${BIN:-<none found>}"
@@ -1016,7 +1050,9 @@ main() {
     pair)      require_cmds curl; cmd_pair "${2:-}" "${3:-}" ;;
     link)      cmd_link ;;
     poll)      need_root "$@"; require_cmds curl jq sha256sum flock; cmd_poll ;;
-    *) echo "usage: $0 {install|run|check|status|pair|poll|uninstall}"; exit 1 ;;
+    self-update|selfupdate|update-self) cmd_self_update "$@" ;;
+    version|--version|-v) echo "nym-node-autoupdate $SCRIPT_VERSION" ;;
+    *) echo "usage: $0 {install|run|check|status|pair|self-update|version|poll|uninstall}"; exit 1 ;;
   esac
 }
 main "$@"
