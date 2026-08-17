@@ -32,6 +32,7 @@
 #   nym-node-autoupdate.sh run        # one unattended check + update of every component
 #   nym-node-autoupdate.sh check      # read-only: report whether newer releases exist (installs nothing)
 #   nym-node-autoupdate.sh status     # print detected/configured setup and last known state
+#   nym-node-autoupdate.sh pair <CODE># bind this node to your Telegram (get <CODE> by sending /link to the bot)
 #   nym-node-autoupdate.sh uninstall  # remove the timer (leaves config, state and binaries alone)
 #
 set -euo pipefail
@@ -74,8 +75,9 @@ CHANGELOG_ACTIONS="${NYM_CHANGELOG_ACTIONS:-0}"   # 0 = report only (SAFE DEFAUL
 TELEGRAM_BOT_TOKEN="${NYM_TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${NYM_TELEGRAM_CHAT_ID:-}"
 
-# Nymi (shared Telegram bot) endpoints. The node never holds a bot token - it
-# tells the hub "this node belongs to @nick" and asks "was I asked to update?".
+# Nymi (shared Telegram bot) endpoints. The node never holds a bot token - it proves
+# ownership to the hub with a one-time code the operator gets in the bot (`pair`), then
+# asks "was I asked to update?" (`poll`), authenticating every poll with its own secret.
 NYMI_HUB_BASE="${NYM_NYMI_HUB:-https://nymcheckby.unclelem.uk/nymi}"
 
 SELF_PATH="$(readlink -f "$0")"
@@ -825,17 +827,13 @@ UNIT
   echo "Re-run '$DEST_PATH install' to change settings, or edit $CONFIG_FILE."
   notify success "now watching this node (${role}). I'll ping you on updates, rollbacks, or anything that needs you."
 
-  # Register this node with Nymi (the shared Telegram bot) so its operator gets alerts.
-  if [[ "${NYM_ASSUME_YES:-0}" != "1" && -t 0 ]]; then
-    local tgnick
-    read -rp "Your Telegram @nick for Nymi alerts (blank to skip): " tgnick
-    if [[ -n "$tgnick" ]]; then
-      cmd_link "$tgnick" || true
-      echo ">>> Open https://t.me/nyminodebot and press Start to activate Nymi."
-    fi
-  elif [[ -n "${NYM_NYMI_NICK:-}" ]]; then
-    cmd_link "$NYM_NYMI_NICK" || true
-  fi
+  # Pair this node with Nymi (the shared Telegram bot) so force-update works and the
+  # operator gets alerts. Pairing needs a one-time code issued in the bot, so it can't
+  # be done unattended here - point the operator at the two-step flow instead.
+  echo
+  echo ">>> To finish setup and unlock force-update from the bot:"
+  echo "      1) open  https://t.me/nyminodebot  and send  /link"
+  echo "      2) it gives you a code; then run:  $DEST_PATH pair <CODE>"
 
   if [[ "${NYM_ASSUME_YES:-0}" != "1" && -t 0 ]]; then
     local now
@@ -925,35 +923,49 @@ nymi_secret() {   # per-node secret proving THIS node to the hub (0600, generate
   cat "$f" 2>/dev/null
 }
 
-cmd_link() {   # link this node to a Telegram operator on Nymi, by their @nick
-  local nick="${1:-}" ip="${2:-}"
-  nick="${nick#@}"
-  [[ -n "$nick" ]] || die "usage: $0 link @your_telegram_nick [node_ip]"
+cmd_pair() {   # pair this node to a Telegram operator with a one-time code from the bot
+  local codev="${1:-}" ip="${2:-}"
+  codev="$(printf '%s' "$codev" | tr -dc 'A-Za-z0-9' | tr '[:lower:]' '[:upper:]')"
+  [[ -n "$codev" ]] || die "usage: $0 pair <CODE>   (get a code: open https://t.me/nyminodebot and send /link)"
   if [[ -z "$ip" ]]; then
     ip="$(curl -4 -s --max-time 8 https://api.ipify.org 2>/dev/null || true)"
     [[ "$ip" =~ ^[0-9.]+$ ]] || ip="$(curl -4 -s --max-time 8 https://ifconfig.me 2>/dev/null || true)"
   fi
   [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
-    die "could not auto-detect this node's IP; run: $0 link @$nick <node_ip>"
+    die "could not auto-detect this node's IP; run: $0 pair $codev <node_ip>"
   mkdir -p "$STATE_DIR" 2>/dev/null || true
   printf '%s' "$ip" > "$STATE_DIR/nymi_node_ip" 2>/dev/null || true   # for the poll
   local resp secret; secret="$(nymi_secret)"
-  resp="$(curl -s --max-time 12 --proto '=https' --proto-redir '=https' -X POST "$NYMI_HUB_BASE/link" \
-            --data-urlencode "nick=$nick" --data-urlencode "ip=$ip" \
+  # The code proves to the hub that whoever asked for it in the bot is the same person
+  # setting up this box. Only then does the hub bind this node (ip + its secret) to that
+  # chat and allow force-updates. A stranger who only knows the IP has no code, so no bind.
+  # force IPv4 so the hub sees this request coming FROM the node's IPv4 (== the ident
+  # it's registering); the hub binds pairing to that source IP as proof of node control.
+  resp="$(curl -4 -s --max-time 12 --proto '=https' --proto-redir '=https' -X POST "$NYMI_HUB_BASE/pair" \
+            --data-urlencode "code=$codev" --data-urlencode "ip=$ip" \
             --data-urlencode "updater=1" --data-urlencode "secret=$secret" 2>/dev/null || true)"
   case "$resp" in
-    *'"linked"'*)
-      echo "Linked node $ip to @$nick on Nymi - you should see it in the bot now." ;;
-    *'"pending"'*)
-      echo "Registered node $ip for @$nick."
-      echo "Now open  https://t.me/nyminodebot  and press Start - it links the instant you do." ;;
-    *different?secret*|*'"error"'*)
-      echo "Nymi refused: ${resp:-<none>}"
-      echo "This node may already be linked with a different secret (a prior install)." ;;
+    *'"paired"'*|*'already paired"'*)
+      echo "Paired node $ip to your Telegram on Nymi - force-update will work now." ;;
+    *'already paired to someone'*)
+      echo "Nymi says this node is already paired to a different operator."
+      echo "If it's yours, send /link in the bot for a code, then re-run: $0 pair <CODE>" ;;
+    *'pairing code'*)
+      echo "Nymi refused: that code is missing, wrong, or expired."
+      echo "Get a fresh one: open https://t.me/nyminodebot, send /link, then: $0 pair <CODE>" ;;
+    *'supports'*|*'"error"'*)
+      echo "Nymi refused: ${resp:-<none>}" ;;
     *)
       echo "Sent to Nymi, but the reply was unexpected: ${resp:-<none>}"
-      echo "Open https://t.me/nyminodebot, press Start, then retry: $0 link @$nick" ;;
+      echo "Open https://t.me/nyminodebot, send /link for a code, then: $0 pair <CODE>" ;;
   esac
+}
+
+cmd_link() {   # DEPRECATED: the unauthenticated nick-link is gone; use `pair <code>`
+  echo "Heads up: 'link @nick' is gone - it let anyone who knew a node's IP claim it."
+  echo "It's replaced by a secure one-time pairing code:"
+  echo "  1) In Telegram, open  https://t.me/nyminodebot  and send:  /link"
+  echo "  2) It replies with a code. Then on this node run:  $0 pair <CODE>"
 }
 
 cmd_poll() {   # frequent timer: did the operator press "update now" in the bot?
@@ -996,9 +1008,10 @@ main() {
     uninstall) need_root "$@"; cmd_uninstall ;;
     check)     require_cmds curl jq; cmd_check ;;
     status)    cmd_status ;;
-    link)      require_cmds curl; cmd_link "${2:-}" "${3:-}" ;;
+    pair)      require_cmds curl; cmd_pair "${2:-}" "${3:-}" ;;
+    link)      cmd_link ;;
     poll)      need_root "$@"; require_cmds curl jq sha256sum flock; cmd_poll ;;
-    *) echo "usage: $0 {install|run|check|status|link|poll|uninstall}"; exit 1 ;;
+    *) echo "usage: $0 {install|run|check|status|pair|poll|uninstall}"; exit 1 ;;
   esac
 }
 main "$@"
