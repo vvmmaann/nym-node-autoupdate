@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.2.0 - 2026-10-02
+
+Gateways now update on their own. On 2026-10-02 both of our gateways rolled back a good release:
+
+- **Health check waits for a stable service.** It now requires the service to stay up for 60s
+  without a restart, within 180s (`NYM_HEALTH_STABLE`, `NYM_HEALTH_MAX`). Before, it was a single
+  check at ~30s. A gateway can exit at startup when a chain RPC call fails ("DKG contract is
+  unavailable", RPC 502/timeout). Systemd's `Restart=` then brings it up 30s later, but the old
+  check had already rolled back. The old version failed the same way in the same minute, so the
+  release was not at fault. Rollback is verified by the same check, so the false "rollback did NOT
+  restore a healthy service" alarm is gone too. `NYM_HEALTH_WAIT` is no longer used.
+- **Gateways are stopped with SIGKILL.** A gateway nym-node's graceful shutdown stalled for
+  3.3-3.8 min on every stop we measured, so each update took the node down for ~4 min. A SIGKILL
+  to the running process stops it in ~2s. Mixnodes still stop gracefully (0-5s). Override with
+  `NYM_STOP_MODE=graceful|kill`.
+- **Nymi gets the real outcome.** A force-update that rolled back used to report "noreleases".
+  It now reports `failed` (rolled back, node up), `critical` (rollback unhealthy) or `busy` (an
+  hourly run held the lock).
+
+Update with `sudo /usr/local/sbin/nym-node-autoupdate.sh self-update`.
+
 ## 1.1.0 - 2026-08-17
 
 - **Pairing to Nymi reworked.** `pair @yourhandle`, run **on the node**, replaces `link @nick`.

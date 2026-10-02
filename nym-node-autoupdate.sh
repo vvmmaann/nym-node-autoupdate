@@ -47,11 +47,16 @@ BRIDGE_REPO="nymtech/nym-bridges"; BRIDGE_TAG_PREFIX="bridge-binaries-v"; BRIDGE
 NTM_REPO_PATH="scripts/nym-node-setup/network-tunnel-manager.sh"  # tunnel manager, from $REPO
 
 MIN_AGE_HOURS="${NYM_MIN_AGE_HOURS:-2}"     # ignore releases younger than this (soak delay)
-HEALTH_WAIT="${NYM_HEALTH_WAIT:-25}"        # seconds to wait after restart before health check
+HEALTH_STABLE="${NYM_HEALTH_STABLE:-60}"    # the service must stay up this long, with no restart, to pass
+HEALTH_MAX="${NYM_HEALTH_MAX:-180}"         # give up (and roll back) if it is not stable within this many seconds
+STOP_MODE="${NYM_STOP_MODE:-auto}"          # auto | graceful | kill  (see stop_unit)
 KEEP_BACKUPS="${NYM_KEEP_BACKUPS:-3}"       # how many old binaries to keep, per component
 # fall back to defaults on non-numeric input, else sleep/arithmetic would abort under set -e/-u
 [[ "$MIN_AGE_HOURS" =~ ^[0-9]+$ ]] || MIN_AGE_HOURS=2
-[[ "$HEALTH_WAIT"   =~ ^[0-9]+$ ]] || HEALTH_WAIT=25
+[[ "$HEALTH_STABLE" =~ ^[0-9]+$ ]] || HEALTH_STABLE=60
+[[ "$HEALTH_MAX"    =~ ^[0-9]+$ ]] || HEALTH_MAX=180
+(( HEALTH_MAX >= HEALTH_STABLE + 10 )) || HEALTH_MAX=$(( HEALTH_STABLE + 10 ))
+[[ "$STOP_MODE" =~ ^(auto|graceful|kill)$ ]] || STOP_MODE=auto
 [[ "$KEEP_BACKUPS"  =~ ^[0-9]+$ ]] || KEEP_BACKUPS=3
 # --retry-all-errors needs curl >= 7.71; probe once so we never hard-fail on older LTS curl.
 RETRY_ALL=""
@@ -84,7 +89,7 @@ NYMI_HUB_BASE="${NYM_NYMI_HUB:-https://nymcheckby.unclelem.uk/nymi}"
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 SELF_UPDATE_URL="${NYM_SELF_UPDATE_URL:-https://raw.githubusercontent.com/vvmmaann/nym-node-autoupdate/main/nym-node-autoupdate.sh}"
 
 # --------------------------------- logging ----------------------------------
@@ -325,22 +330,68 @@ is_blacklisted() {        # return 0 = skip this tag
   return 1
 }
 
-# is_healthy <unit> <bin> <expected_version_or_empty> - active at two samples ~8s apart, with no
-# restart between them (crash-loop guard). Works for Type=simple/forking/notify/oneshot+RemainAfterExit
-# (does NOT demand SubState=running or a live main PID, which false-fail healthy non-simple units).
+# is_healthy <unit> <bin> <expected_version_or_empty> - the unit must stay active for HEALTH_STABLE
+# seconds within one activation (crash-loop guard), and it gets up to HEALTH_MAX seconds to get there.
+# A single crash that systemd's own Restart= recovers from is tolerated: a new activation simply restarts
+# the stability window. Why: a gateway exits at startup when a chain RPC call fails (seen 2026-10-02 on
+# two gateways, old AND new version alike, ~30s after start), and a short fixed check rolled back a good
+# binary. Works for Type=simple/forking/notify/oneshot+RemainAfterExit (does NOT demand SubState=running
+# or a live main PID, which false-fail healthy non-simple units). Used identically by install and rollback.
 is_healthy() {
-  local u="$1" b="$2" expect="${3:-}" a1 a2 t1 t2 rv
-  a1="$(sctl is-active "$u" 2>/dev/null || true)"
-  t1="$(sctl show -p ActiveEnterTimestampMonotonic --value "$u" 2>/dev/null || echo 0)"
-  sleep 8
-  a2="$(sctl is-active "$u" 2>/dev/null || true)"
-  t2="$(sctl show -p ActiveEnterTimestampMonotonic --value "$u" 2>/dev/null || echo 0)"
-  [[ "$a1" == "active" && "$a2" == "active" ]] || return 1
-  [[ "$t1" == "$t2" ]] || return 1
+  local u="$1" b="$2" expect="${3:-}" a t t0="" since=-1 el=0 restarts=0 rv
   if [[ -n "$expect" ]]; then
     rv="$(bin_version "$b")"
     [[ -z "$rv" || "$rv" == "$expect" ]] || return 1   # unparseable version = inconclusive = pass
   fi
+  while (( el <= HEALTH_MAX )); do
+    a="$(sctl is-active "$u" 2>/dev/null || true)"
+    t="$(sctl show -p ActiveEnterTimestampMonotonic --value "$u" 2>/dev/null || echo 0)"
+    if [[ "$a" == "active" ]]; then
+      if [[ "$t" != "$t0" ]]; then
+        [[ -n "$t0" ]] && { restarts=$((restarts+1)); log "  $u re-activated (restart #$restarts); stability window restarts"; }
+        t0="$t"; since=$el
+      fi
+      if (( el - since >= HEALTH_STABLE )); then
+        (( restarts == 0 )) || log "  $u stable for ${HEALTH_STABLE}s after $restarts restart(s)"
+        return 0
+      fi
+    else
+      since=-1
+    fi
+    sleep 5; el=$((el+5))
+  done
+  log "  $u not stable for ${HEALTH_STABLE}s within ${HEALTH_MAX}s (last state: ${a:-?}, restarts seen: $restarts)"
+  return 1
+}
+
+# stop_unit <unit> <role> - stop the service before the binary swap.
+# A gateway nym-node ignores its graceful shutdown: every gateway stop measured (2026-09-16 and
+# 2026-10-02, two hosts) took 3.3-3.8 min - the node's own shutdown stalls, systemd's SIGKILL after
+# TimeoutStopSec does not take effect for another ~2 min. A SIGKILL sent to the RUNNING gateway
+# process instead stops it in ~2s (4 of 4 times). Mixnodes stop gracefully in 0-5s, so they keep it.
+#   STOP_MODE=auto     -> gateway nym-node: SIGKILL; anything else: graceful, SIGKILL if still up after 90s
+#   STOP_MODE=graceful -> always the plain `systemctl stop`
+#   STOP_MODE=kill     -> always SIGKILL
+stop_unit() {
+  local u="$1" role="${2:-}" mode="$STOP_MODE" i st
+  [[ "$mode" == "auto" ]] && { [[ "$role" == gateway* ]] && mode=kill || mode=graceful; }
+  if [[ "$mode" == "graceful" ]]; then
+    sctl stop --no-block "$u" 2>/dev/null || true
+    for i in $(seq 1 90); do
+      st="$(sctl is-active "$u" 2>/dev/null || true)"
+      [[ "$st" == "inactive" || "$st" == "failed" ]] && return 0
+      sleep 1
+    done
+    log "  $u still stopping after 90s; sending SIGKILL"
+  fi
+  sctl kill -s SIGKILL "$u" 2>/dev/null || true
+  for i in $(seq 1 60); do
+    st="$(sctl is-active "$u" 2>/dev/null || true)"
+    [[ "$st" == "inactive" || "$st" == "failed" || "$st" == "activating" ]] && break
+    sleep 1
+  done
+  sctl stop "$u" 2>/dev/null || true          # cancel a pending Restart= so the swap happens while stopped
+  sctl reset-failed "$u" 2>/dev/null || true
   return 0
 }
 
@@ -351,7 +402,8 @@ is_healthy() {
 # Returns: 0 = updated or nothing-to-do; 1 = aborted/rolled-back (service up); 2 = critical.
 update_component() {
   local NAME="$1" CREPO="$2" CPREF="$3" CASSET="$4" CBIN="$5" CUNIT="$6" CSTATE="$7" CFAILED="$8" SMODE="$9"
-  local curver=""
+  local curver="" srole=""
+  [[ "$NAME" == "nym-node" ]] && srole="${ROLE:-}"   # the gateway stop quirk is nym-node's, not the bridge's
   [[ "$SMODE" == "version" ]] && curver="$(bin_version "$CBIN")"
 
   local rels latest tag published url hashurl
@@ -425,7 +477,7 @@ update_component() {
     fi
 
     log "[$NAME] stopping $CUNIT"
-    sctl stop "$CUNIT" || log "[$NAME] warning: stop returned non-zero"
+    stop_unit "$CUNIT" "$srole"
     if ! mv -f "$staged" "$CBIN"; then
       log "[$NAME] atomic swap failed; restoring previous binary"
       rm -f "$staged" 2>/dev/null || true
@@ -435,7 +487,6 @@ update_component() {
     log "[$NAME] installed new binary; starting $CUNIT"
     sctl start "$CUNIT" || log "[$NAME] warning: start returned non-zero"
 
-    sleep "$HEALTH_WAIT"
     if is_healthy "$CUNIT" "$CBIN" "$newver"; then
       printf '%s\n' "$tag" > "$CSTATE"
       log "[$NAME] SUCCESS: $CUNIT healthy on ${newver:-$tag}"
@@ -446,13 +497,12 @@ update_component() {
 
     # rollback: restore the previous binary (atomically), record the failure, verify just as strictly
     log "[$NAME] HEALTH CHECK FAILED for $tag; ROLLING BACK to previous binary"
-    sctl stop "$CUNIT" || true
+    stop_unit "$CUNIT" "$srole"
     if cp -a "$backup" "$dir/.nau-rb.$$" 2>/dev/null && mv -f "$dir/.nau-rb.$$" "$CBIN" 2>/dev/null; then :; else
       log "[$NAME] CRITICAL: rollback restore failed ($backup -> $CBIN)"; rm -f "$dir/.nau-rb.$$" 2>/dev/null || true
     fi
     sctl start "$CUNIT" || true
     record_fail "$CFAILED" "$tag"
-    sleep "$HEALTH_WAIT"
     if is_healthy "$CUNIT" "$CBIN" "$curver"; then
       log "[$NAME] ROLLBACK OK: restored ${curver:-previous} binary, $CUNIT healthy again. $tag failure recorded."
       notify rollback "$NAME update to $tag FAILED; rolled back to ${curver:-previous}, $CUNIT is UP"; rc=1; break
@@ -685,7 +735,8 @@ cmd_run() {
   apply_changelog_actions "$(cat "$STATE_TAG" 2>/dev/null || true)" || true
 
   log "run complete (nym-node rc=$node_rc, nym-bridge rc=$bridge_rc, ntm rc=$ntm_rc)"
-  if (( node_rc != 0 || bridge_rc != 0 || ntm_rc != 0 )); then exit 1; fi
+  printf '%s\n' "$node_rc" > "$STATE_DIR/last_node_rc" 2>/dev/null || true   # read by cmd_poll for the bot
+  if (( node_rc != 0|| bridge_rc != 0 || ntm_rc != 0 )); then exit 1; fi
   exit 0
 }
 
@@ -1022,11 +1073,19 @@ cmd_poll() {   # frequent timer: did the operator press "update now" in the bot?
   printf '%s' "$resp" | grep -qE '"run"[[:space:]]*:[[:space:]]*true' || return 0
   log "[nymi] force-update requested from the bot; running now"
   resolve_target
-  local before after outcome
+  local before after outcome rc=0 node_rc
   before="$(bin_version "${BIN:-/bin/false}" 2>/dev/null || echo '')"
-  ( exec 9>"$LOCKFILE"; flock -n 9 && cmd_run ) || true
+  rm -f "$STATE_DIR/last_node_rc" 2>/dev/null || true
+  ( exec 9>"$LOCKFILE"; flock -n 9 || exit 75; cmd_run ) || rc=$?
   after="$(bin_version "${BIN:-/bin/false}" 2>/dev/null || echo '')"
-  if [[ -n "$after" && "$after" != "$before" ]]; then outcome="updated"; else outcome="noreleases"; fi
+  node_rc="$(cat "$STATE_DIR/last_node_rc" 2>/dev/null || true)"
+  # updated = version changed; failed = new version rolled back (node up on the old one);
+  # critical = rollback not healthy either; busy = an hourly run held the lock; else nothing new
+  if [[ -n "$after" && "$after" != "$before" ]]; then outcome="updated"
+  elif [[ "$node_rc" == "1" ]]; then outcome="failed"
+  elif [[ "$node_rc" == "2" ]]; then outcome="critical"
+  elif (( rc == 75 )); then outcome="busy"
+  else outcome="noreleases"; fi
   curl -s --max-time 10 --proto '=https' --proto-redir '=https' -X POST "$NYMI_HUB_BASE/result" \
     --data-urlencode "ip=$ip" --data-urlencode "secret=$secret" \
     --data-urlencode "outcome=$outcome" --data-urlencode "version=${after:-}" >/dev/null 2>&1 || true

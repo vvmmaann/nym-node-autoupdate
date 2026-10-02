@@ -49,15 +49,19 @@ The script detects the node's role automatically; you do not configure it per ro
   Nym's `nym-binaries-v*` line ships no signatures, so trust still reduces to "GitHub and the nymtech
   release account are uncompromised" - the same assumption as a manual install.
 - **Smoke tested** - the new binary must run `--version` successfully before it is installed.
-- **Automatic rollback** - after restart it checks the service is `active`, `running`, on the new
-  version, and not crash-looping (PID stable across a second window). If any check fails it restores
-  the previous binary and restarts. A release that fails is recorded and never retried (until you
-  clear it), so it cannot churn-restart your node forever.
+- **Automatic rollback** - after restart the service must be on the new version and stay `active`
+  for `HEALTH_STABLE` (60s) without a restart, within `HEALTH_MAX` (180s). One crash that systemd's
+  own `Restart=` recovers from is tolerated (a gateway can exit at startup on a transient chain RPC
+  error, old and new versions alike); a crash loop is not. If the check fails it restores the
+  previous binary and verifies it the same way. A release that fails is retried once on a later run,
+  then left alone (until you clear it), so it cannot churn-restart your node forever.
 - **Backups kept** - the previous binaries are kept under `/var/lib/nym-autoupdate/backups`.
 - **Minimal downtime on success** - when the new binary is healthy the only downtime is the
   stop -> copy -> start window (a couple of seconds); all download/verify work happens before the
-  service is touched. On a *failed* swap the node is down for roughly `HEALTH_WAIT` (~25s) until the
-  health check fails and the rollback restores the old binary - still bounded, but not "a couple of seconds".
+  service is touched. A gateway nym-node is stopped with SIGKILL, because its graceful shutdown
+  stalls for 3-4 minutes (measured on every gateway stop we have); mixnodes stop gracefully.
+  On a *failed* swap the node can be down for up to `HEALTH_MAX` (~3 min) until the health check
+  gives up and the rollback restores the old binary - bounded, but not "a couple of seconds".
 - **Soak delay** - a release younger than `MIN_AGE_HOURS` (default 2h) is not adopted yet, so brand-new
   releases are given time to settle. This is a delay, not yank-detection: it does not actively check
   whether a release was later pulled or demoted.
@@ -161,7 +165,9 @@ nothing is ever pushed into your node - the node checks in and pulls the request
 | Variable             | Default | Meaning                                                       |
 |----------------------|---------|---------------------------------------------------------------|
 | `NYM_MIN_AGE_HOURS`  | `2`     | Ignore releases younger than this many hours.                 |
-| `NYM_HEALTH_WAIT`    | `25`    | Seconds to wait after restart before the health check.        |
+| `NYM_HEALTH_STABLE`  | `60`    | Seconds the service must stay up, with no restart, to pass the health check. |
+| `NYM_HEALTH_MAX`     | `180`   | Seconds to wait for that before rolling back.                 |
+| `NYM_STOP_MODE`      | `auto`  | `auto` = SIGKILL for a gateway nym-node, graceful otherwise; or `graceful` / `kill`. |
 | `NYM_KEEP_BACKUPS`   | `3`     | How many previous binaries to keep.                           |
 | `NYM_ASSUME_YES`     | `0`     | `1` skips the interactive confirmation (for batch installs).  |
 | `NYM_NYMI_NICK`      | -       | Telegram `@nick` to link this node to Nymi during a batch install. |
