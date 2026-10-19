@@ -38,6 +38,12 @@ demand. See [Nymi (Telegram alerts)](#nymi-telegram-alerts) below. **The node ne
   it is pinned to the release's **commit SHA** (immutable), fetched over HTTPS, and run as root - see
   the Trust model section. Detected via the `nymtun0` interface.
 
+- **`nym-api`** (validator API / ecash signer) - **only if `nym-api.service` exists**, with or without
+  a nym-node on the same box. Same source, SHA-256 check, soak delay and hourly run as `nym-node`
+  (right after it on a box with both). After the restart the API must answer its health endpoint,
+  report the new build version, and an ecash signer must still have its keys; otherwise it rolls back.
+  It is never restarted while a DKG ceremony is running. Its own state: `api_last_tag`, `api_failed_tags`.
+
 The script detects the node's role automatically; you do not configure it per role.
 
 ## Why it is safe
@@ -172,11 +178,14 @@ nothing is ever pushed into your node - the node checks in and pulls the request
 | `NYM_ASSUME_YES`     | `0`     | `1` skips the interactive confirmation (for batch installs).  |
 | `NYM_NYMI_NICK`      | -       | Telegram `@nick` to link this node to Nymi during a batch install. |
 | `NYM_NYMI_HUB`       | `https://nymcheckby.unclelem.uk/nymi` | Nymi hub endpoint base (advanced; leave as-is). |
+| `NYM_API_MIN_AGE_HOURS` | same as `NYM_MIN_AGE_HOURS` | Soak delay for nym-api releases, written to the config at install (`API_MIN_AGE_HOURS`). |
+| `NYM_API_UNIT` / `NYM_API_BIN` / `NYM_API_URL` | detected | Override the nym-api unit, binary, or the local URL it answers on (from `bind_address`). |
 
 ## State and logs
 
-- Config: `/etc/nym-node-autoupdate.conf` (`UNIT`, `BIN`, `SVC_USER`) - edit by hand any time.
-- State: `/var/lib/nym-autoupdate/` (`last_tag`, `failed_tags`, `backups/`).
+- Config: `/etc/nym-node-autoupdate.conf` (`UNIT`, `BIN`, `SVC_USER`, `API_UNIT`, `API_BIN`, `API_URL`,
+  `API_MIN_AGE_HOURS`) - edit by hand any time.
+- State: `/var/lib/nym-autoupdate/` (`last_tag`, `failed_tags`, `api_last_tag`, `api_failed_tags`, `backups/`).
 - Logs: `/var/log/nym-autoupdate.log` and the system journal (`journalctl -t nym-autoupdate`).
 - To retry a release that previously failed health check here: remove its line from
   `/var/lib/nym-autoupdate/failed_tags`.

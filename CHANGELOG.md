@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.3.0 - 2026-10-19
+
+nym-api support. A validator operator's nym-api (validator API / ecash signer) is now updated the
+same way as a nym-node:
+
+- **Detected from `nym-api.service`**, like the bridge. A box can run nym-api alone, with no
+  nym-node; on a box with both, nym-api is updated right after nym-node in the same run.
+- **Same release, checksum and rhythm as nym-node**: the `nym-api` asset of the latest stable
+  `nym-binaries-v*` release, SHA-256 from its `hashes.json`, the same 2h soak (`API_MIN_AGE_HOURS`
+  in the config to change it) and the same hourly timer. State is kept apart (`api_last_tag`,
+  `api_failed_tags`) because nym-api has its own version numbers.
+- **Stricter health check.** After the restart the API must answer `/v1/api-status/health` with
+  `up`, report the new build in `/v1/api-status/build-information`, and an ecash signer must still
+  report `isEcashSigner`, `hasSigningKeys` and not `signerDisabled`. Otherwise it rolls back.
+  `chain_status` is not required, so a node still catching up does not roll back a good binary.
+- **Never restarted mid DKG ceremony.** Before an update the DKG contract's epoch state is read
+  (local LCD first, then api.nymtech.net); anything but `in_progress` / `waiting_initialisation`
+  defers the update to the next run.
+- **"Update now" from Nymi works for it** like for a node: pair the nym-api box with
+  `pair @yourhandle`, and `/update` in the bot lists it.
+
+Update with `sudo /usr/local/sbin/nym-node-autoupdate.sh self-update`. Existing nym-node setups
+behave exactly as before.
+
 ## 1.2.0 - 2026-10-02
 
 Gateways now update on their own. On 2026-10-02 both of our gateways rolled back a good release:

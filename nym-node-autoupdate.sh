@@ -13,6 +13,12 @@
 #                  Fetched from github.com/nymtech/nym and RUN AS ROOT. There is no upstream
 #                  checksum/signature; this trusts the integrity of the nym GitHub org, the same
 #                  as running their documented install by hand. Set NTM_ENABLED=0 to opt out.
+#   * nym-api    - a nym-api (validator API / ecash signer), only if nym-api.service exists. Same
+#                  source, SHA-256 check, soak delay and hourly run as nym-node, updated right after
+#                  it. After the restart it must answer its own health endpoint, report the new build
+#                  version, and keep its signer state (an ecash signer must still have its keys). It
+#                  is never restarted mid DKG ceremony. A box can run nym-api alone, and "update now"
+#                  from Nymi works for it like for a node (pair the box first).
 #
 # Two phases:
 #   * INSTALL (interactive) - run once. Auto-detects unit/user/binary/role and (on gateways) the
@@ -70,6 +76,11 @@ BACKUP_DIR="$STATE_DIR/backups"
 STATE_TAG="$STATE_DIR/last_tag";               FAILED_TAGS="$STATE_DIR/failed_tags"
 BRIDGE_STATE_TAG="$STATE_DIR/bridge_last_tag"; BRIDGE_FAILED_TAGS="$STATE_DIR/bridge_failed_tags"
 NTM_STATE="$STATE_DIR/ntm_last_tag"
+API_ASSET="nym-api"
+API_STATE_TAG="$STATE_DIR/api_last_tag";       API_FAILED_TAGS="$STATE_DIR/api_failed_tags"
+# DKG contract on Nyx mainnet: a signer is not restarted while a ceremony is running
+API_DKG_CONTRACT="${NYM_API_DKG_CONTRACT:-n19604yflqggs9mk2z26mqygq43q2kr3n932egxx630svywd5mpxjsztfpvx}"
+API_LCDS="${NYM_API_LCDS:-http://127.0.0.1:1317 https://api.nymtech.net}"
 # operator-facing changelog (docs). the release git tag is cut BEFORE its docs section is written,
 # so the section is read from the docs branch, not the tag. official nym source, trusted.
 OP_CHANGELOG_PATH="documentation/docs/pages/operators/changelog.mdx"
@@ -89,7 +100,7 @@ NYMI_HUB_BASE="${NYM_NYMI_HUB:-https://nymcheckby.unclelem.uk/nymi}"
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 SELF_UPDATE_URL="${NYM_SELF_UPDATE_URL:-https://raw.githubusercontent.com/vvmmaann/nym-node-autoupdate/main/nym-node-autoupdate.sh}"
 
 # --------------------------------- logging ----------------------------------
@@ -127,7 +138,7 @@ notify() {
 
 ensure_dirs() {
   mkdir -p "$STATE_DIR" "$BACKUP_DIR"
-  touch "$FAILED_TAGS" "$BRIDGE_FAILED_TAGS" 2>/dev/null || true
+  touch "$FAILED_TAGS" "$BRIDGE_FAILED_TAGS" "$API_FAILED_TAGS" 2>/dev/null || true
 }
 
 # Hard-fail (unit goes red) if a required command is missing, instead of silently never updating.
@@ -172,6 +183,25 @@ detect_bridge_bin() {
   p="$(systemctl show -p ExecStart --value "$unit" 2>/dev/null | grep -oP 'path=\K\S+' | head -n1 || true)"
   if [[ "$p" == /* && -x "$p" ]]; then printf '%s\n' "$p"; return 0; fi
   command -v nym-bridge 2>/dev/null || true
+}
+detect_api_unit() {
+  systemctl list-units --all --type=service --no-legend 2>/dev/null \
+    | awk '{print $1}' | grep -E '^nym-api(@[^.]*)?\.service$' | head -n1 || true
+}
+detect_api_bin() {
+  local unit="${1:-}" p
+  p="$(systemctl show -p ExecStart --value "$unit" 2>/dev/null | grep -oP 'path=\K\S+' | head -n1 || true)"
+  if [[ "$p" == /* && -x "$p" ]]; then printf '%s\n' "$p"; return 0; fi
+  command -v nym-api 2>/dev/null || true
+}
+# where the nym-api answers HTTP: its bind_address from config.toml (0.0.0.0 -> loopback)
+detect_api_url() {
+  local unit="${1:-}" u home b
+  u="$(detect_user "$unit")"; home="$(getent passwd "${u:-root}" | cut -d: -f6)"; home="${home:-/root}"
+  b="$(grep -hoP "^\s*bind_address\s*=\s*['\"]\K[^'\"]+" "$home"/.nym/nym-api/*/config/config.toml 2>/dev/null | head -n1 || true)"
+  [[ -n "$b" ]] || b="127.0.0.1:8080"
+  b="${b/0.0.0.0/127.0.0.1}"
+  printf 'http://%s\n' "$b"
 }
 detect_user() {
   local unit="${1:-}" u
@@ -230,6 +260,7 @@ sctl() {
 # Resolve everything from the saved config first, falling back to live detection.
 resolve_target() {
   UNIT=""; BIN=""; SVC_USER=""; ROLE=""; BRIDGE_UNIT=""; BRIDGE_BIN=""; NTM_ENABLED=""; NTM_PATH=""; NTM_IFACE=""; SVC_SCOPE=""; SSH_PORT=""
+  API_UNIT=""; API_BIN=""; API_URL=""; API_MIN_AGE_HOURS=""
   if [[ -f "$CONFIG_FILE" ]]; then
     # only trust the config if it is root-owned and not group/other-writable (we source it as root)
     if [[ "$(stat -c '%U' "$CONFIG_FILE" 2>/dev/null || echo '?')" == "root" \
@@ -241,8 +272,17 @@ resolve_target() {
     fi
   fi
   [[ -n "${UNIT:-}" ]]        || UNIT="$(detect_unit)"
-  [[ -n "${BIN:-}" ]]         || BIN="$(detect_bin "$UNIT")"
-  [[ -n "${SVC_USER:-}" ]]    || SVC_USER="$(detect_user "$UNIT")"
+  [[ -n "${UNIT:-}" && -z "${BIN:-}" ]] && BIN="$(detect_bin "$UNIT")"
+  [[ -n "${API_UNIT:-}" ]]    || API_UNIT="$(detect_api_unit)"
+  if [[ -n "${API_UNIT:-}" ]]; then
+    [[ -n "${API_BIN:-}" ]] || API_BIN="$(detect_api_bin "$API_UNIT")"
+    [[ -n "${API_URL:-}" ]] || API_URL="$(detect_api_url "$API_UNIT")"
+  fi
+  # same soak as nym-node unless the config sets its own
+  [[ "${API_MIN_AGE_HOURS:-}" =~ ^[0-9]+$ ]] || API_MIN_AGE_HOURS="${NYM_API_MIN_AGE_HOURS:-$MIN_AGE_HOURS}"
+  [[ "$API_MIN_AGE_HOURS" =~ ^[0-9]+$ ]] || API_MIN_AGE_HOURS="$MIN_AGE_HOURS"
+  [[ "${API_URL:-}" =~ ^https?://[A-Za-z0-9.:_-]+$ ]] || API_URL=""
+  [[ -n "${SVC_USER:-}" ]]    || SVC_USER="$(detect_user "${UNIT:-$API_UNIT}")"
   [[ -n "${BRIDGE_UNIT:-}" ]] || BRIDGE_UNIT="$(detect_bridge_unit)"
   if [[ -n "${BRIDGE_UNIT:-}" && -z "${BRIDGE_BIN:-}" ]]; then BRIDGE_BIN="$(detect_bridge_bin "$BRIDGE_UNIT")"; fi
   [[ -n "${ROLE:-}" ]]        || ROLE="$(detect_role "$UNIT")"
@@ -275,6 +315,12 @@ SSH_PORT="${11:-}"
 # Telegram alerts (optional). Both empty = alerts off. This file is root-only (0600) because of them.
 TELEGRAM_BOT_TOKEN="${12:-}"
 TELEGRAM_CHAT_ID="${13:-}"
+# nym-api (optional): leave API_UNIT empty to skip it. API_URL is where it answers HTTP locally.
+# API_MIN_AGE_HOURS = soak delay for nym-api releases, same as nym-node's by default.
+API_UNIT="${14:-}"
+API_BIN="${15:-}"
+API_URL="${16:-}"
+API_MIN_AGE_HOURS="${17:-$MIN_AGE_HOURS}"
 EOF
   chmod 0600 "$CONFIG_FILE"
 }
@@ -364,6 +410,47 @@ is_healthy() {
   return 1
 }
 
+# ------------------------------ nym-api checks ------------------------------
+api_get() { curl -fsS --max-time 8 "${API_URL}$1" 2>/dev/null; }
+# "isEcashSigner hasSigningKeys signerDisabled", e.g. "true true false"; empty if it does not answer
+api_signer_state() {
+  api_get /v1/ecash/signer-status | jq -r '.body | "\(.isEcashSigner) \(.hasSigningKeys) \(.signerDisabled)"' 2>/dev/null || true
+}
+# api_http_healthy <expected_version> <signer state before the update>
+# The API must say it is up, run the new build, and an ecash signer must still be one with its keys.
+# chain_status is NOT required: a node still catching up is no reason to roll back a good binary.
+api_http_healthy() {
+  local want="$1" before="${2:-}" i h v s
+  for i in $(seq 1 24); do
+    h="$(api_get /v1/api-status/health | jq -r '.status // empty' 2>/dev/null || true)"
+    v="$(api_get /v1/api-status/build-information | jq -r '.build_version // empty' 2>/dev/null || true)"
+    s="$(api_signer_state)"
+    if [[ "$h" == "up" && ( -z "$want" || "$v" == "$want" ) ]]; then
+      if [[ "$before" != "true true false" || "$s" == "true true false" ]]; then
+        log "  nym-api answers: health=$h version=${v:-?} signer=[${s:-n/a}]"; return 0
+      fi
+    fi
+    sleep 5
+  done
+  log "  nym-api HTTP check failed: health=${h:-none} version=${v:-?} (want ${want:-any}) signer=[${s:-n/a}] (before [${before:-n/a}])"
+  return 1
+}
+# 0 = a DKG ceremony is running right now (do not restart a signer); 1 = idle or unknown
+api_dkg_busy() {
+  local lcd st="" b64
+  b64="$(printf '%s' '{"get_current_epoch_state":{}}' | base64 -w0)"
+  for lcd in $API_LCDS; do
+    st="$(curl -fsS --max-time 10 "$lcd/cosmwasm/wasm/v1/contract/$API_DKG_CONTRACT/smart/$b64" 2>/dev/null \
+          | jq -r '.data.state | if type=="string" then . else (keys[0] // empty) end' 2>/dev/null || true)"
+    [[ -n "$st" ]] && break
+  done
+  [[ -n "$st" ]] || { log "[nym-api] could not read the DKG state; assuming no ceremony"; return 1; }
+  case "$st" in
+    in_progress|waiting_initialisation) return 1 ;;
+    *) log "[nym-api] DKG ceremony in progress (state: $st); not restarting the signer now, will retry"; return 0 ;;
+  esac
+}
+
 # stop_unit <unit> <role> - stop the service before the binary swap.
 # A gateway nym-node ignores its graceful shutdown: every gateway stop measured (2026-09-16 and
 # 2026-10-02, two hosts) took 3.3-3.8 min - the node's own shutdown stalls, systemd's SIGKILL after
@@ -402,7 +489,7 @@ stop_unit() {
 # Returns: 0 = updated or nothing-to-do; 1 = aborted/rolled-back (service up); 2 = critical.
 update_component() {
   local NAME="$1" CREPO="$2" CPREF="$3" CASSET="$4" CBIN="$5" CUNIT="$6" CSTATE="$7" CFAILED="$8" SMODE="$9"
-  local curver="" srole=""
+  local curver="" srole="" api_before=""
   [[ "$NAME" == "nym-node" ]] && srole="${ROLE:-}"   # the gateway stop quirk is nym-node's, not the bridge's
   [[ "$SMODE" == "version" ]] && curver="$(bin_version "$CBIN")"
 
@@ -476,6 +563,7 @@ update_component() {
       log "[$NAME] could not stage new binary in $dir; aborting (no change made)"; rm -f "$staged" 2>/dev/null || true; rc=1; break
     fi
 
+    [[ "$NAME" == "nym-api" ]] && api_before="$(api_signer_state)"
     log "[$NAME] stopping $CUNIT"
     stop_unit "$CUNIT" "$srole"
     if ! mv -f "$staged" "$CBIN"; then
@@ -487,7 +575,8 @@ update_component() {
     log "[$NAME] installed new binary; starting $CUNIT"
     sctl start "$CUNIT" || log "[$NAME] warning: start returned non-zero"
 
-    if is_healthy "$CUNIT" "$CBIN" "$newver"; then
+    if is_healthy "$CUNIT" "$CBIN" "$newver" \
+       && { [[ "$NAME" != "nym-api" ]] || api_http_healthy "$newver" "$api_before"; }; then
       printf '%s\n' "$tag" > "$CSTATE"
       log "[$NAME] SUCCESS: $CUNIT healthy on ${newver:-$tag}"
       notify success "$NAME updated to ${newver:-$tag} and healthy"
@@ -709,34 +798,57 @@ apply_changelog_actions() {   # arg: tag  -- notify-only, does NOT run anything
 }
 
 # --------------------------------- run --------------------------------------
+# nym-api with its own soak delay (a dynamic-scope local shadows the global for update_component)
+update_api() {
+  local MIN_AGE_HOURS="$API_MIN_AGE_HOURS"
+  update_component "nym-api" "$REPO" "$TAG_PREFIX" "$API_ASSET" \
+                   "$API_BIN" "$API_UNIT" "$API_STATE_TAG" "$API_FAILED_TAGS" "version"
+}
+
 cmd_run() {
   ensure_dirs
   resolve_target
-  [[ -n "$UNIT" ]]                       || die "no nym-node systemd service found (run 'install' first)"
-  sctl cat "$UNIT" >/dev/null 2>&1       || die "configured unit '$UNIT' not known to systemd (${SVC_SCOPE:-system} scope)"
-  [[ -n "$BIN" && -x "$BIN" ]]           || die "could not locate the nym-node binary ('$BIN')"
-  log "target: unit=$UNIT user=$SVC_USER bin=$BIN role=$ROLE"
+  [[ -n "$UNIT" || -n "${API_UNIT:-}" ]] || die "no nym-node or nym-api systemd service found (run 'install' first)"
+  local node_rc=0 bridge_rc=0 ntm_rc=0 api_rc=0
 
-  local node_rc=0 bridge_rc=0
-  update_component "nym-node" "$REPO" "$TAG_PREFIX" "$ASSET" \
-                   "$BIN" "$UNIT" "$STATE_TAG" "$FAILED_TAGS" "version" || node_rc=$?
+  if [[ -n "$UNIT" ]]; then
+    sctl cat "$UNIT" >/dev/null 2>&1       || die "configured unit '$UNIT' not known to systemd (${SVC_SCOPE:-system} scope)"
+    [[ -n "$BIN" && -x "$BIN" ]]           || die "could not locate the nym-node binary ('$BIN')"
+    log "target: unit=$UNIT user=$SVC_USER bin=$BIN role=$ROLE"
 
-  if [[ -n "${BRIDGE_UNIT:-}" ]] && systemctl cat "$BRIDGE_UNIT" >/dev/null 2>&1 \
-        && [[ -n "${BRIDGE_BIN:-}" && -x "${BRIDGE_BIN:-}" ]]; then
-    log "gateway: also checking QUIC bridge ($BRIDGE_UNIT)"
-    update_component "nym-bridge" "$BRIDGE_REPO" "$BRIDGE_TAG_PREFIX" "$BRIDGE_ASSET" \
-                     "$BRIDGE_BIN" "$BRIDGE_UNIT" "$BRIDGE_STATE_TAG" "$BRIDGE_FAILED_TAGS" "runs" || bridge_rc=$?
+    update_component "nym-node" "$REPO" "$TAG_PREFIX" "$ASSET" \
+                     "$BIN" "$UNIT" "$STATE_TAG" "$FAILED_TAGS" "version" || node_rc=$?
+
+    if [[ -n "${BRIDGE_UNIT:-}" ]] && systemctl cat "$BRIDGE_UNIT" >/dev/null 2>&1 \
+          && [[ -n "${BRIDGE_BIN:-}" && -x "${BRIDGE_BIN:-}" ]]; then
+      log "gateway: also checking QUIC bridge ($BRIDGE_UNIT)"
+      update_component "nym-bridge" "$BRIDGE_REPO" "$BRIDGE_TAG_PREFIX" "$BRIDGE_ASSET" \
+                       "$BRIDGE_BIN" "$BRIDGE_UNIT" "$BRIDGE_STATE_TAG" "$BRIDGE_FAILED_TAGS" "runs" || bridge_rc=$?
+    fi
+
+    maybe_run_ntm || ntm_rc=$?
+
+    # run any remaining operator actions the official changelog lists (non-tunnel; deny-list enforced)
+    apply_changelog_actions "$(cat "$STATE_TAG" 2>/dev/null || true)" || true
   fi
 
-  local ntm_rc=0
-  maybe_run_ntm || ntm_rc=$?
+  if [[ -n "${API_UNIT:-}" ]]; then
+    if ! systemctl cat "$API_UNIT" >/dev/null 2>&1 || [[ -z "${API_BIN:-}" || ! -x "${API_BIN:-}" ]]; then
+      log "[nym-api] unit '$API_UNIT' or binary '${API_BIN:-}' not found; skipping nym-api"; api_rc=1
+    elif [[ -z "${API_URL:-}" ]]; then
+      log "[nym-api] no API_URL (where it answers HTTP); skipping nym-api"; api_rc=1
+    elif api_dkg_busy; then
+      :
+    else
+      log "target: nym-api unit=$API_UNIT bin=$API_BIN url=$API_URL soak=${API_MIN_AGE_HOURS}h"
+      update_api || api_rc=$?
+    fi
+  fi
 
-  # run any remaining operator actions the official changelog lists (non-tunnel; deny-list enforced)
-  apply_changelog_actions "$(cat "$STATE_TAG" 2>/dev/null || true)" || true
-
-  log "run complete (nym-node rc=$node_rc, nym-bridge rc=$bridge_rc, ntm rc=$ntm_rc)"
-  printf '%s\n' "$node_rc" > "$STATE_DIR/last_node_rc" 2>/dev/null || true   # read by cmd_poll for the bot
-  if (( node_rc != 0|| bridge_rc != 0 || ntm_rc != 0 )); then exit 1; fi
+  log "run complete (nym-node rc=$node_rc, nym-bridge rc=$bridge_rc, ntm rc=$ntm_rc, nym-api rc=$api_rc)"
+  # read by cmd_poll for the bot: the box's main component (nym-node, or nym-api on an api-only box)
+  printf '%s\n' "$( [[ -n "$UNIT" ]] && echo "$node_rc" || echo "$api_rc" )" > "$STATE_DIR/last_node_rc" 2>/dev/null || true
+  if (( node_rc != 0 || bridge_rc != 0 || ntm_rc != 0 || api_rc != 0 )); then exit 1; fi
   exit 0
 }
 
@@ -763,6 +875,14 @@ cmd_install() {
   if [[ -n "$brunit" ]]; then brbin="$(detect_bridge_bin "$brunit")"; brver="$(dpkg-query -W -f='${Version}' nym-bridge 2>/dev/null || true)"; fi
   local ntm_en ntm_path ntm_iface
   IFS=$'\t' read -r ntm_en ntm_path ntm_iface < <(detect_ntm) || true
+  local apiunit apibin apiurl apiver apiage
+  apiunit="${NYM_API_UNIT:-$(detect_api_unit)}"; apibin=""; apiurl=""; apiver=""
+  apiage="${NYM_API_MIN_AGE_HOURS:-$MIN_AGE_HOURS}"; [[ "$apiage" =~ ^[0-9]+$ ]] || apiage="$MIN_AGE_HOURS"
+  if [[ -n "$apiunit" ]]; then
+    apibin="${NYM_API_BIN:-$(detect_api_bin "$apiunit")}"; apiurl="${NYM_API_URL:-$(detect_api_url "$apiunit")}"
+    apiver="$(bin_version "${apibin:-/bin/false}")"
+  fi
+  if [[ -z "$unit" ]]; then svcuser="$(detect_user "$apiunit")"; role="none (nym-api box)"; fi
 
   echo "Detected on $(hostname):"
   echo "  nym-node unit : ${unit:-<NOT FOUND>}"
@@ -780,6 +900,11 @@ cmd_install() {
   else
     echo "  tunnel (NTM)  : not an exit gateway -> NTM step skipped"
   fi
+  if [[ -n "$apiunit" ]]; then
+    echo "  nym-api       : ${apiunit}  bin=${apibin:-<?>}  ver=${apiver:-<?>}  url=${apiurl:-<?>}  -> auto-updated (SHA-256, HTTP + signer check, soak ${apiage}h)"
+  else
+    echo "  nym-api       : none -> skipped"
+  fi
   echo
 
   if [[ "${NYM_ASSUME_YES:-0}" != "1" && -t 0 ]]; then
@@ -791,6 +916,11 @@ cmd_install() {
       read -rp "  service user    [${svcuser}]: " a; svcuser="${a:-$svcuser}"
       read -rp "  bridge unit (blank=none) [${brunit}]: " a; brunit="${a-$brunit}"
       if [[ -n "$brunit" ]]; then read -rp "  bridge bin    [${brbin}]: " a; brbin="${a:-$brbin}"; else brbin=""; fi
+      read -rp "  nym-api unit (blank=none) [${apiunit}]: " a; apiunit="${a-$apiunit}"
+      if [[ -n "$apiunit" ]]; then
+        read -rp "  nym-api bin     [${apibin}]: " a; apibin="${a:-$apibin}"
+        read -rp "  nym-api url     [${apiurl}]: " a; apiurl="${a:-$apiurl}"
+      else apibin=""; apiurl=""; fi
       read -rp "  enable NTM tunnel checks? (1/0) [${ntm_en}]: " a; ntm_en="${a:-$ntm_en}"
       if [[ "$ntm_en" == "1" ]]; then
         read -rp "  NTM script path [${ntm_path}]: " a;  ntm_path="${a:-$ntm_path}"
@@ -802,9 +932,16 @@ cmd_install() {
   fi
 
   # validate before committing anything
-  [[ -n "$unit" ]] || die "no systemd unit set; aborting"
-  sctl cat "$unit" >/dev/null 2>&1 || die "unit '$unit' not found in ${svcscope} scope; aborting"
-  [[ -n "$bin" && -x "$bin" ]] || die "nym-node binary '$bin' missing or not executable; aborting"
+  [[ -n "$unit" || -n "$apiunit" ]] || die "no nym-node or nym-api systemd unit found; aborting"
+  if [[ -n "$unit" ]]; then
+    sctl cat "$unit" >/dev/null 2>&1 || die "unit '$unit' not found in ${svcscope} scope; aborting"
+    [[ -n "$bin" && -x "$bin" ]] || die "nym-node binary '$bin' missing or not executable; aborting"
+  fi
+  if [[ -n "$apiunit" ]]; then
+    systemctl cat "$apiunit" >/dev/null 2>&1 || die "nym-api unit '$apiunit' not found by systemd; aborting"
+    [[ -n "$apibin" && -x "$apibin" ]] || die "nym-api binary '$apibin' missing or not executable; aborting"
+    [[ "$apiurl" =~ ^https?://[A-Za-z0-9.:_-]+$ ]] || die "nym-api url '$apiurl' looks wrong; aborting"
+  fi
   if [[ -n "$brunit" ]]; then
     systemctl cat "$brunit" >/dev/null 2>&1 || die "bridge unit '$brunit' not found by systemd; aborting"
     [[ -n "$brbin" && -x "$brbin" ]] || die "bridge binary '$brbin' missing or not executable; aborting"
@@ -818,15 +955,15 @@ cmd_install() {
     [[ -n "$tg_token" ]] || tg_token="$(sed -n 's/^TELEGRAM_BOT_TOKEN="\(.*\)"$/\1/p' "$CONFIG_FILE" | head -n1)"
     [[ -n "$tg_chat"  ]] || tg_chat="$(sed -n 's/^TELEGRAM_CHAT_ID="\(.*\)"$/\1/p'  "$CONFIG_FILE" | head -n1)"
   fi
-  save_config "$unit" "$bin" "${svcuser:-root}" "$role" "$brunit" "$brbin" "${ntm_en:-0}" "$ntm_path" "${ntm_iface:-nymtun0}" "$svcscope" "$sshport" "$tg_token" "$tg_chat"
+  save_config "$unit" "$bin" "${svcuser:-root}" "$role" "$brunit" "$brbin" "${ntm_en:-0}" "$ntm_path" "${ntm_iface:-nymtun0}" "$svcscope" "$sshport" "$tg_token" "$tg_chat" "$apiunit" "$apibin" "$apiurl" "$apiage"
   local tg_state=off; [[ -n "$tg_token" && -n "$tg_chat" ]] && tg_state=on
-  log "saved config -> $CONFIG_FILE (unit=$unit bin=$bin user=${svcuser:-root} scope=${svcscope} bridge=${brunit:-none} ntm=${ntm_en:-0} ssh_port=${sshport} telegram=${tg_state})"
+  log "saved config -> $CONFIG_FILE (unit=${unit:-none} bin=${bin:-none} user=${svcuser:-root} scope=${svcscope} bridge=${brunit:-none} ntm=${ntm_en:-0} api=${apiunit:-none} ssh_port=${sshport} telegram=${tg_state})"
   TELEGRAM_BOT_TOKEN="$tg_token"; TELEGRAM_CHAT_ID="$tg_chat"
 
   install -m 0755 "$SELF_PATH" "$DEST_PATH"
   cat > /etc/systemd/system/nym-node-autoupdate.service <<UNIT
 [Unit]
-Description=nym-node auto-updater (nym-node + QUIC bridge + tunnel rules on new stable releases)
+Description=Nym auto-updater (nym-node, QUIC bridge, tunnel rules, nym-api on new stable releases)
 After=network-online.target
 Wants=network-online.target
 
@@ -836,7 +973,7 @@ ExecStart=$DEST_PATH run
 UNIT
   cat > /etc/systemd/system/nym-node-autoupdate.timer <<UNIT
 [Unit]
-Description=Run nym-node auto-updater hourly
+Description=Run the Nym auto-updater hourly
 
 [Timer]
 OnCalendar=hourly
@@ -952,7 +1089,8 @@ cmd_check() {             # read-only: report whether newer releases exist (no c
   curver="$(bin_version "${BIN:-/bin/false}")"
   inst="$(cat "$STATE_TAG" 2>/dev/null || echo '<none>')"
   lt="$(gh_releases "$REPO" 2>/dev/null | pick_latest "$TAG_PREFIX" "$ASSET" 2>/dev/null | cut -f1 || true)"
-  if   [[ -z "$lt" ]];       then echo "nym-node   : could not reach GitHub"
+  if   [[ -z "${UNIT:-}" ]]; then echo "nym-node   : none on this box"
+  elif [[ -z "$lt" ]];       then echo "nym-node   : could not reach GitHub"
   elif [[ "$lt" == "$inst" ]]; then echo "nym-node   : up to date (${curver:-?}, $lt)"
   else                            echo "nym-node   : UPDATE AVAILABLE -> $lt   (installed ${curver:-?}, last applied $inst)"; fi
 
@@ -963,6 +1101,15 @@ cmd_check() {             # read-only: report whether newer releases exist (no c
     if   [[ -z "$blt" ]];        then echo "nym-bridge : could not reach GitHub"
     elif [[ "$blt" == "$binst" ]]; then echo "nym-bridge : up to date ($blt)"
     else                              echo "nym-bridge : UPDATE AVAILABLE -> $blt   (last applied $binst)"; fi
+  fi
+
+  if [[ -n "${API_UNIT:-}" ]]; then
+    local ainst alt aver
+    ainst="$(cat "$API_STATE_TAG" 2>/dev/null || echo '<none>')"; aver="$(bin_version "${API_BIN:-/bin/false}")"
+    alt="$(gh_releases "$REPO" 2>/dev/null | pick_latest "$TAG_PREFIX" "$API_ASSET" 2>/dev/null | cut -f1 || true)"
+    if   [[ -z "$alt" ]];        then echo "nym-api    : could not reach GitHub"
+    elif [[ "$alt" == "$ainst" ]]; then echo "nym-api    : up to date (${aver:-?}, $alt)"
+    else                              echo "nym-api    : UPDATE AVAILABLE -> $alt   (installed ${aver:-?}, last applied $ainst)"; fi
   fi
 
   if [[ "${NTM_ENABLED:-0}" == "1" && -n "$lt" ]]; then
@@ -998,6 +1145,13 @@ cmd_status() {
     echo "ntm last_tag  : $(cat "$NTM_STATE" 2>/dev/null || echo '<none>')"
   else
     echo "tunnel (NTM)  : disabled (no $NTM_IFACE interface / not an exit gateway)"
+  fi
+  if [[ -n "${API_UNIT:-}" ]]; then
+    echo "nym-api unit  : ${API_UNIT}  bin=${API_BIN:-<?>}  ver=$(bin_version "${API_BIN:-/bin/false}")  active=$(systemctl is-active "$API_UNIT" 2>/dev/null || true)"
+    echo "nym-api url   : ${API_URL:-<none>}  soak=${API_MIN_AGE_HOURS}h  signer=[$(api_signer_state)]"
+    echo "nym-api last  : $(cat "$API_STATE_TAG" 2>/dev/null || echo '<none>')"
+  else
+    echo "nym-api       : none (updates skipped)"
   fi
   echo "config        : $( [[ -f "$CONFIG_FILE" ]] && echo "$CONFIG_FILE" || echo '<none - live detection>')"
   if [[ -f /etc/systemd/system/nym-node-autoupdate.timer ]]; then
@@ -1074,10 +1228,11 @@ cmd_poll() {   # frequent timer: did the operator press "update now" in the bot?
   log "[nymi] force-update requested from the bot; running now"
   resolve_target
   local before after outcome rc=0 node_rc
-  before="$(bin_version "${BIN:-/bin/false}" 2>/dev/null || echo '')"
+  local vbin="${BIN:-}"; [[ -n "${UNIT:-}" ]] || vbin="${API_BIN:-}"
+  before="$(bin_version "${vbin:-/bin/false}" 2>/dev/null || echo '')"
   rm -f "$STATE_DIR/last_node_rc" 2>/dev/null || true
   ( exec 9>"$LOCKFILE"; flock -n 9 || exit 75; cmd_run ) || rc=$?
-  after="$(bin_version "${BIN:-/bin/false}" 2>/dev/null || echo '')"
+  after="$(bin_version "${vbin:-/bin/false}" 2>/dev/null || echo '')"
   node_rc="$(cat "$STATE_DIR/last_node_rc" 2>/dev/null || true)"
   # updated = version changed; failed = new version rolled back (node up on the old one);
   # critical = rollback not healthy either; busy = an hourly run held the lock; else nothing new
