@@ -835,6 +835,9 @@ cmd_run() {
   if [[ -n "${API_UNIT:-}" ]]; then
     if ! systemctl cat "$API_UNIT" >/dev/null 2>&1 || [[ -z "${API_BIN:-}" || ! -x "${API_BIN:-}" ]]; then
       log "[nym-api] unit '$API_UNIT' or binary '${API_BIN:-}' not found; skipping nym-api"; api_rc=1
+    elif [[ "$(systemctl is-active "$API_UNIT" 2>/dev/null || true)" != "active" ]]; then
+      # a leftover or deliberately stopped nym-api is not ours to start
+      log "[nym-api] $API_UNIT is not running; leaving it alone"
     elif [[ -z "${API_URL:-}" ]]; then
       log "[nym-api] no API_URL (where it answers HTTP); skipping nym-api"; api_rc=1
     elif api_dkg_busy; then
