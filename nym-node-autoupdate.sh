@@ -57,6 +57,12 @@ HEALTH_STABLE="${NYM_HEALTH_STABLE:-60}"    # the service must stay up this long
 HEALTH_MAX="${NYM_HEALTH_MAX:-180}"         # give up (and roll back) if it is not stable within this many seconds
 STOP_MODE="${NYM_STOP_MODE:-auto}"          # auto | graceful | kill  (see stop_unit)
 KEEP_BACKUPS="${NYM_KEEP_BACKUPS:-3}"       # how many old binaries to keep, per component
+# Quiet gate: restart nym-node only while it carries (almost) no traffic, i.e. out of the active set
+# and after the leftover traffic has drained. auto = mixnodes only (gateways always have clients).
+QUIET_GATE="${NYM_QUIET_GATE:-auto}"        # auto | on | off
+QUIET_PPS="${NYM_QUIET_PPS:-10}"            # packets/s below which the node counts as idle
+QUIET_MAX_HOURS="${NYM_QUIET_MAX_HOURS:-48}" # stop waiting and update anyway after this long
+NODE_HTTP="${NYM_NODE_HTTP:-http://127.0.0.1:8080}"  # nym-node's own HTTP API (metrics)
 # fall back to defaults on non-numeric input, else sleep/arithmetic would abort under set -e/-u
 [[ "$MIN_AGE_HOURS" =~ ^[0-9]+$ ]] || MIN_AGE_HOURS=2
 [[ "$HEALTH_STABLE" =~ ^[0-9]+$ ]] || HEALTH_STABLE=60
@@ -64,6 +70,9 @@ KEEP_BACKUPS="${NYM_KEEP_BACKUPS:-3}"       # how many old binaries to keep, per
 (( HEALTH_MAX >= HEALTH_STABLE + 10 )) || HEALTH_MAX=$(( HEALTH_STABLE + 10 ))
 [[ "$STOP_MODE" =~ ^(auto|graceful|kill)$ ]] || STOP_MODE=auto
 [[ "$KEEP_BACKUPS"  =~ ^[0-9]+$ ]] || KEEP_BACKUPS=3
+[[ "$QUIET_GATE" =~ ^(auto|on|off)$ ]] || QUIET_GATE=auto
+[[ "$QUIET_PPS" =~ ^[0-9]+$ ]] || QUIET_PPS=10
+[[ "$QUIET_MAX_HOURS" =~ ^[0-9]+$ ]] || QUIET_MAX_HOURS=48
 # --retry-all-errors needs curl >= 7.71; probe once so we never hard-fail on older LTS curl.
 RETRY_ALL=""
 if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then RETRY_ALL="--retry-all-errors"; fi
@@ -100,7 +109,7 @@ NYMI_HUB_BASE="${NYM_NYMI_HUB:-https://nymcheckby.unclelem.uk/nymi}"
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.4.0"
 SELF_UPDATE_URL="${NYM_SELF_UPDATE_URL:-https://raw.githubusercontent.com/vvmmaann/nym-node-autoupdate/main/nym-node-autoupdate.sh}"
 
 # --------------------------------- logging ----------------------------------
@@ -321,6 +330,12 @@ API_UNIT="${14:-}"
 API_BIN="${15:-}"
 API_URL="${16:-}"
 API_MIN_AGE_HOURS="${17:-$MIN_AGE_HOURS}"
+# Quiet gate: restart nym-node only while it is idle (out of the active set, leftover traffic gone).
+# QUIET_GATE = auto (mixnodes only) | on | off. NODE_HTTP = where nym-node's own HTTP API answers.
+QUIET_GATE="$QUIET_GATE"
+QUIET_PPS="$QUIET_PPS"
+QUIET_MAX_HOURS="$QUIET_MAX_HOURS"
+NODE_HTTP="$NODE_HTTP"
 EOF
   chmod 0600 "$CONFIG_FILE"
 }
@@ -482,6 +497,63 @@ stop_unit() {
   return 0
 }
 
+# ------------------------------- quiet gate ----------------------------------
+# Packets/s the node is mixing right now, from its own metrics (last ~30 s window). Empty = unknown.
+node_pps() {
+  local m
+  m="$(curl -fsS --max-time 5 "$NODE_HTTP/api/v1/metrics/mixing" 2>/dev/null)" || return 0
+  printf '%s' "$m" | jq -r '
+    (.received_since_last_update // empty) as $n
+    | ((.update_time // "") | sub("\\.[0-9]+";"") | fromdateiso8601? ) as $t1
+    | ((.previous_update_time // "") | sub("\\.[0-9]+";"") | fromdateiso8601? ) as $t0
+    | if $n == null or $t1 == null or $t0 == null or ($t1 - $t0) <= 0 then empty
+      elif (now - $t1) > 300 then empty            # stale metrics (a stuck task) = unknown, not busy
+      else (($n / ($t1 - $t0)) | floor) end' 2>/dev/null | grep -E '^[0-9]+$' || true
+}
+
+# the config file is sourced after the defaults were validated, so validate again before use
+quiet_validate() {
+  [[ "$QUIET_GATE" =~ ^(auto|on|off)$ ]] || QUIET_GATE=auto
+  [[ "$QUIET_PPS" =~ ^[0-9]+$ ]] || QUIET_PPS=10
+  [[ "$QUIET_MAX_HOURS" =~ ^[0-9]+$ ]] || QUIET_MAX_HOURS=48
+}
+
+quiet_gate_applies() {
+  quiet_validate
+  [[ "${NAU_MANUAL:-0}" == "1" ]] && return 1          # an operator pressed "update now"
+  case "$QUIET_GATE" in
+    on)  return 0 ;;
+    off) return 1 ;;
+  esac
+  [[ "${ROLE:-}" == mixnode* ]] && return 0
+  [[ "${ROLE:-}" == gateway* ]] && return 1
+  # mode set in config.toml rather than on the command line: ask the node itself
+  curl -fsS --max-time 5 "$NODE_HTTP/api/v1/roles" 2>/dev/null \
+    | jq -e '.mixnode_enabled == true and (.gateway_enabled // false) == false' >/dev/null 2>&1
+}
+
+# return 0 = go ahead with the restart now, 1 = defer to a later run. arg: tag
+quiet_gate_ok() {
+  local tag="$1" f="$STATE_DIR/quiet_wait" pps first now waited
+  quiet_gate_applies || return 0
+  pps="$(node_pps)"
+  now="$(date -u +%s)"
+  if [[ -z "$pps" ]]; then
+    log "[nym-node] quiet gate: could not read traffic from $NODE_HTTP; not blocking the update"; rm -f "$f"; return 0
+  fi
+  if (( pps < QUIET_PPS )); then
+    log "[nym-node] quiet gate: ${pps} pkt/s (< ${QUIET_PPS}), node is idle; updating now"; rm -f "$f"; return 0
+  fi
+  first="$(awk -v t="$tag" '$1==t{print $2}' "$f" 2>/dev/null || true)"
+  [[ "$first" =~ ^[0-9]+$ ]] || { first="$now"; printf '%s %s\n' "$tag" "$now" > "$f"; }
+  waited=$(( (now - first) / 3600 ))
+  if (( waited >= QUIET_MAX_HOURS )); then
+    log "[nym-node] quiet gate: still ${pps} pkt/s after ${waited}h of waiting; updating anyway"; rm -f "$f"; return 0
+  fi
+  log "[nym-node] quiet gate: ${pps} pkt/s (>= ${QUIET_PPS}), node is carrying traffic; deferring $tag (waiting ${waited}h of max ${QUIET_MAX_HOURS}h)"
+  return 1
+}
+
 # ----------------------- the generic component updater ----------------------
 # update_component <name> <repo> <tagprefix> <asset> <bin> <unit> <statefile> <failedfile> <smoke>
 #   smoke = "version" (nym-node: must report a build version; refuses install without a checksum)
@@ -507,6 +579,7 @@ update_component() {
   local age; age="$(age_hours "$published")" || { log "[$NAME] cannot parse release age for $tag; deferring this cycle"; return 0; }
   if (( age < MIN_AGE_HOURS )); then log "[$NAME] newest $tag only ${age}h old (< ${MIN_AGE_HOURS}h); waiting"; return 0; fi
   log "[$NAME] new release available: $tag (published $published, ~${age}h ago)"
+  if [[ "$NAME" == "nym-node" ]] && ! quiet_gate_ok "$tag"; then return 0; fi
 
   local tmp rc=0
   tmp="$(mktemp -d "$STATE_DIR/tmp.XXXXXX" 2>/dev/null)" || { log "[$NAME] mktemp failed; skip this cycle"; return 0; }
@@ -564,6 +637,11 @@ update_component() {
     fi
 
     [[ "$NAME" == "nym-api" ]] && api_before="$(api_signer_state)"
+    # the download and checks above can take minutes; if an epoch changed meanwhile and the node
+    # was put into the active set, do not restart it now (nothing has been changed yet)
+    if [[ "$NAME" == "nym-node" ]] && ! quiet_gate_ok "$tag"; then
+      rm -f "$staged" "$backup" 2>/dev/null || true; rc=0; break
+    fi
     log "[$NAME] stopping $CUNIT"
     stop_unit "$CUNIT" "$srole"
     if ! mv -f "$staged" "$CBIN"; then
@@ -1095,7 +1173,14 @@ cmd_check() {             # read-only: report whether newer releases exist (no c
   if   [[ -z "${UNIT:-}" ]]; then echo "nym-node   : none on this box"
   elif [[ -z "$lt" ]];       then echo "nym-node   : could not reach GitHub"
   elif [[ "$lt" == "$inst" ]]; then echo "nym-node   : up to date (${curver:-?}, $lt)"
-  else                            echo "nym-node   : UPDATE AVAILABLE -> $lt   (installed ${curver:-?}, last applied $inst)"; fi
+  else                            echo "nym-node   : UPDATE AVAILABLE -> $lt   (installed ${curver:-?}, last applied $inst)"
+    if quiet_gate_applies; then
+      local qp; qp="$(node_pps)"
+      if [[ -z "$qp" ]]; then echo "             quiet gate: traffic unknown (no fresh metrics on $NODE_HTTP), the gate will not block"
+      elif (( qp >= QUIET_PPS )); then echo "             quiet gate: node busy (${qp} pkt/s), the update waits until it is idle"
+      else echo "             quiet gate: node idle (${qp} pkt/s), the next run updates"; fi
+    fi
+  fi
 
   if [[ -n "${BRIDGE_UNIT:-}" ]]; then
     local binst blt
@@ -1137,6 +1222,12 @@ cmd_status() {
   echo "active        : $(systemctl is-active "${UNIT:-nonexistent.service}" 2>/dev/null || true)"
   echo "node last_tag : $(cat "$STATE_TAG" 2>/dev/null || echo '<none>')"
   echo "node failed   : $(cut -f1 "$FAILED_TAGS" 2>/dev/null | tr '\n' ' ' || true)"
+  local qp; qp="$(node_pps)"
+  if quiet_gate_applies; then
+    echo "quiet gate    : on (${QUIET_GATE}); traffic now ${qp:-?} pkt/s, updates wait below ${QUIET_PPS} pkt/s (max ${QUIET_MAX_HOURS}h)"
+  else
+    echo "quiet gate    : off for this node (${QUIET_GATE}); traffic now ${qp:-?} pkt/s"
+  fi
   if [[ -n "${BRIDGE_UNIT:-}" ]]; then
     echo "bridge unit   : ${BRIDGE_UNIT}  bin=${BRIDGE_BIN:-<?>}  active=$(systemctl is-active "$BRIDGE_UNIT" 2>/dev/null || true)"
     echo "bridge last   : $(cat "$BRIDGE_STATE_TAG" 2>/dev/null || echo '<none>')"
@@ -1228,7 +1319,8 @@ cmd_poll() {   # frequent timer: did the operator press "update now" in the bot?
             -H "Authorization: Bearer $secret" \
             "$NYMI_HUB_BASE/poll?ip=$ip" 2>/dev/null || true)"
   printf '%s' "$resp" | grep -qE '"run"[[:space:]]*:[[:space:]]*true' || return 0
-  log "[nymi] force-update requested from the bot; running now"
+  log "[nymi] force-update requested from the bot; running now (quiet gate skipped: operator asked)"
+  export NAU_MANUAL=1
   resolve_target
   local before after outcome rc=0 node_rc
   local vbin="${BIN:-}"; [[ -n "${UNIT:-}" ]] || vbin="${API_BIN:-}"

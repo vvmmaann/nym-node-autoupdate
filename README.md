@@ -68,6 +68,16 @@ The script detects the node's role automatically; you do not configure it per ro
   stalls for 3-4 minutes (measured on every gateway stop we have); mixnodes stop gracefully.
   On a *failed* swap the node can be down for up to `HEALTH_MAX` (~3 min) until the health check
   gives up and the rollback restores the old binary - bounded, but not "a couple of seconds".
+- **Quiet gate (mixnodes)** - a mixnode is restarted only while it carries almost no traffic: out of
+  the active set, after the leftover traffic has drained. The node's own metrics
+  (`/api/v1/metrics/mixing`) must show fewer than `QUIET_PPS` (10) packets/s; otherwise the update
+  waits for a later hourly run. In the active set a mixnode moves thousands of packets/s, out of it
+  about one. The traffic is checked again right before the stop, in case an epoch changed during
+  the download. Exceptions, on purpose: after `QUIET_MAX_HOURS` (48h) of waiting for the same release
+  it updates anyway; if the node gives no fresh metrics the gate does not block; pressing "update
+  now" in Nymi skips the gate. Gateways always have clients, so for them the gate is off by default
+  (`QUIET_GATE=on` to force it). The settings live in `/etc/nym-node-autoupdate.conf` (the timer
+  does not see `NYM_*` variables; `install` writes them into the config and keeps them on re-install).
 - **Soak delay** - a release younger than `MIN_AGE_HOURS` (default 2h) is not adopted yet, so brand-new
   releases are given time to settle. This is a delay, not yank-detection: it does not actively check
   whether a release was later pulled or demoted.
@@ -175,6 +185,10 @@ nothing is ever pushed into your node - the node checks in and pulls the request
 | `NYM_HEALTH_MAX`     | `180`   | Seconds to wait for that before rolling back.                 |
 | `NYM_STOP_MODE`      | `auto`  | `auto` = SIGKILL for a gateway nym-node, graceful otherwise; or `graceful` / `kill`. |
 | `NYM_KEEP_BACKUPS`   | `3`     | How many previous binaries to keep.                           |
+| `NYM_QUIET_GATE`     | `auto`  | `auto` = wait for an idle node on mixnodes only; `on` = on every role; `off` = never wait. Also settable as `QUIET_GATE=` in the config file. |
+| `NYM_QUIET_PPS`      | `10`    | Packets/s below which the node counts as idle (`QUIET_PPS=` in the config). |
+| `NYM_QUIET_MAX_HOURS`| `48`    | Update anyway after waiting this long for an idle node (`QUIET_MAX_HOURS=` in the config). |
+| `NYM_NODE_HTTP`      | `http://127.0.0.1:8080` | Where nym-node's own HTTP API answers (metrics and roles). |
 | `NYM_ASSUME_YES`     | `0`     | `1` skips the interactive confirmation (for batch installs).  |
 | `NYM_NYMI_NICK`      | -       | Telegram `@nick` to link this node to Nymi during a batch install. |
 | `NYM_NYMI_HUB`       | `https://nymcheckby.unclelem.uk/nymi` | Nymi hub endpoint base (advanced; leave as-is). |

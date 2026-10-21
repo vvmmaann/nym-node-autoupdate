@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.4.0 - 2026-10-21
+
+Quiet gate: a mixnode is updated only while it is idle. Idea from Andrew in the operators chat.
+
+- **Restart only out of the active set.** Before restarting nym-node on a mixnode the updater reads
+  the node's own metrics (`/api/v1/metrics/mixing`). At 10 packets/s or more the node is carrying
+  traffic (in the active set it moves thousands per second, out of it about one), so the update
+  waits for a later hourly run. This also covers the leftover traffic right after the node leaves
+  the set: it waits until that has drained too. The traffic is checked again right before the
+  stop, in case the node entered the set while the release was downloading.
+- **Bounded wait.** After 48h of waiting for the same release it updates anyway, so a node that
+  stays in the set for days does not fall behind forever. Metrics older than 5 minutes or missing
+  count as unknown, and unknown never blocks an update.
+- **Settings survive a re-install.** `install` writes `QUIET_GATE`, `QUIET_PPS`, `QUIET_MAX_HOURS`
+  and `NODE_HTTP` into `/etc/nym-node-autoupdate.conf` and keeps your values.
+- **Gateways unchanged.** They always have clients, so the gate is off for them by default.
+  `QUIET_GATE=on|off` in `/etc/nym-node-autoupdate.conf` changes that; `QUIET_PPS` and
+  `QUIET_MAX_HOURS` tune the threshold and the wait.
+- **"Update now" in Nymi skips the gate**: an operator asking for it gets it immediately.
+- `status` and `check` show the current traffic and whether the gate would wait.
+
+Update with `sudo /usr/local/sbin/nym-node-autoupdate.sh self-update`.
+
 ## 1.3.0 - 2026-10-19
 
 nym-api support. A validator operator's nym-api (validator API / ecash signer) is now updated the
