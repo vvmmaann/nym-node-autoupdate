@@ -116,7 +116,7 @@ NYMI_HUB_BASE="${NYM_NYMI_HUB:-https://nymcheckby.unclelem.uk/nymi}"
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.8.0"
 SELF_UPDATE_URL="${NYM_SELF_UPDATE_URL:-https://raw.githubusercontent.com/vvmmaann/nym-node-autoupdate/main/nym-node-autoupdate.sh}"
 
 # --------------------------------- logging ----------------------------------
@@ -1496,7 +1496,7 @@ cmd_poll() {   # frequent timer: did the operator press "update now" in the bot?
   fi
   [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 0
   resp="$(curl -s --max-time 8 --proto '=https' --proto-redir '=https' \
-            -H "Authorization: Bearer $secret" \
+            -H "Authorization: Bearer $secret" -H "X-Updater-Version: $SCRIPT_VERSION" \
             "$NYMI_HUB_BASE/poll?ip=$ip" 2>/dev/null || true)"
   printf '%s' "$resp" | grep -qE '"run"[[:space:]]*:[[:space:]]*true' || return 0
   log "[nymi] force-update requested from the bot; running now (quiet gate skipped: operator asked)"

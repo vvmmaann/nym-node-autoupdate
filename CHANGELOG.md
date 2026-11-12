@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.8.0 - 2026-11-12
+
+- **The Nymi check-in sends the updater version** (an `X-Updater-Version` header), so the bot can tell
+  which paired nodes still run an old updater. Nothing else is added to the request.
+
 ## 1.7.0 - 2026-11-12
 
 `doctor` now runs when upstream publishes something, not on a clock.

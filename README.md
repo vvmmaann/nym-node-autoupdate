@@ -187,7 +187,8 @@ per-node secret (`/var/lib/nym-autoupdate/nymi_secret`, `0600`) and authenticate
 so only your node can drive its own `/update` or report a result - a stranger who knows your node's
 public IP cannot. A lightweight ~45s timer (`nym-node-autoupdate-poll.timer`) is what lets the
 `/update` button reach the node quickly; it only ever runs the same update the hourly timer would, and
-nothing is ever pushed into your node - the node checks in and pulls the request itself.
+nothing is ever pushed into your node - the node checks in and pulls the request itself. A check-in
+carries the node's IP, its secret (in a header) and the updater version, nothing else.
 
 ## Configuration (environment variables)
 
