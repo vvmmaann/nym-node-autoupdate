@@ -116,7 +116,7 @@ NYMI_HUB_BASE="${NYM_NYMI_HUB:-https://nymcheckby.unclelem.uk/nymi}"
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.6.1"
 SELF_UPDATE_URL="${NYM_SELF_UPDATE_URL:-https://raw.githubusercontent.com/vvmmaann/nym-node-autoupdate/main/nym-node-autoupdate.sh}"
 
 # --------------------------------- logging ----------------------------------
@@ -730,7 +730,8 @@ op_changelog_section() {   # arg: version (tag minus TAG_PREFIX)
             "https://raw.githubusercontent.com/$REPO/$ref/$path" 2>/dev/null)" \
         || cl="$(curl -4 -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --retry 2 --max-time 60 \
             "https://raw.githubusercontent.com/$REPO/$ref/$path" 2>/dev/null)" || continue
-      section="$(printf '%s\n' "$cl" | awk -v pat="^## .v${ver}([^A-Za-z0-9]|$)" '
+      # awk stops at the next section; under systemd SIGPIPE is ignored, so printf would log EPIPE
+      section="$(printf '%s\n' "$cl" 2>/dev/null | awk -v pat="^## .v${ver}([^A-Za-z0-9]|$)" '
         $0 ~ pat {f=1; print; next}
         f && /^## .v20/ {exit}
         f {print}')"

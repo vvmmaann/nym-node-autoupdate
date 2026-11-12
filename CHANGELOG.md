@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.6.1 - 2026-11-12
+
+- No more `printf: write error: Broken pipe` in the journal when the operator notes are read (systemd
+  ignores SIGPIPE, so the pipe into awk reported it).
+
 ## 1.6.0 - 2026-11-12
 
 `doctor`: a check that the updater still matches how Nym publishes releases.
