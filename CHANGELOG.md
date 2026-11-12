@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.7.0 - 2026-11-12
+
+`doctor` now runs when upstream publishes something, not on a clock.
+
+- **Trigger.** The hourly run re-checks when a new nym-node or nym-bridge release appears, prereleases
+  included, so a rename shows up at the prerelease, before a stable release needs it. One more check
+  runs when the newest stable release is 48h old, by when its operator notes should exist. A new
+  script version re-checks too.
+- **NTM of the prerelease** is checked as well as the stable one.
+- **Alerts only on change.** One Telegram alert when the set of problems appears or changes, one when
+  it clears; the same problem is never repeated.
+
 ## 1.6.1 - 2026-11-12
 
 - No more `printf: write error: Broken pipe` in the journal when the operator notes are read (systemd

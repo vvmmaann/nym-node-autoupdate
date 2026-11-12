@@ -116,7 +116,7 @@ NYMI_HUB_BASE="${NYM_NYMI_HUB:-https://nymcheckby.unclelem.uk/nymi}"
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
-SCRIPT_VERSION="1.6.1"
+SCRIPT_VERSION="1.7.0"
 SELF_UPDATE_URL="${NYM_SELF_UPDATE_URL:-https://raw.githubusercontent.com/vvmmaann/nym-node-autoupdate/main/nym-node-autoupdate.sh}"
 
 # --------------------------------- logging ----------------------------------
@@ -906,16 +906,21 @@ newest_release() {        # stdin: releases JSON ; arg: asset
     | "\(.tag_name)\t\(.published_at)\t\(any(.assets[]?; .name==$a))"'
 }
 
+# newest nym-node release, prereleases included (the first place a rename would show up)
+newest_node_tag() {       # stdin: nymtech/nym releases JSON
+  jq -r --arg a "$ASSET" '[.[] | select(.draft==false) | select(any(.assets[]?; .name==$a))]
+    | sort_by(.published_at) | reverse | .[0].tag_name // empty' 2>/dev/null || true
+}
+
 doctor_checks() {
-  local scope="${1:-all}" warn=0 rels lt pub age tag hasa ref path reach=0 tmp c miss
+  local scope="${1:-all}" warn=0 rels lt pub age ntag tag hasa ref path reach=0 tmp c miss t
   # nym-node: the newest release that ships nym-node must carry our tag prefix, and the newest
   # stable one must not be stale (a renamed tag or asset shows up as "nothing new for weeks")
   if rels="$(gh_releases "$REPO" 2>/dev/null)"; then
-    tag="$(printf '%s' "$rels" | jq -r --arg a "$ASSET" '[.[] | select(.draft==false) | select(any(.assets[]?; .name==$a))]
-             | sort_by(.published_at) | reverse | .[0].tag_name // empty' 2>/dev/null || true)"
+    ntag="$(printf '%s' "$rels" | newest_node_tag)"
     IFS=$'\t' read -r lt pub _ _ <<<"$(printf '%s' "$rels" | pick_latest "$TAG_PREFIX" "$ASSET" 2>/dev/null)" || true
-    if [[ -z "$tag" ]]; then echo "WARN nym-node: no recent nymtech/nym release ships an asset named '$ASSET'"; warn=1
-    elif [[ "$tag" != "$TAG_PREFIX"* ]]; then echo "WARN nym-node: newest release with '$ASSET' is tagged '$tag', not '$TAG_PREFIX*'"; warn=1
+    if [[ -z "$ntag" ]]; then echo "WARN nym-node: no recent nymtech/nym release ships an asset named '$ASSET'"; warn=1
+    elif [[ "$ntag" != "$TAG_PREFIX"* ]]; then echo "WARN nym-node: newest release with '$ASSET' is tagged '$ntag', not '$TAG_PREFIX*'"; warn=1
     elif [[ -z "$lt" ]]; then echo "WARN nym-node: no stable '$TAG_PREFIX*' release with '$ASSET'"; warn=1
     else
       age="$(age_hours "$pub" 2>/dev/null || echo 0)"
@@ -950,33 +955,61 @@ doctor_checks() {
     else echo "ok   operator notes: file found, section for $lt not written yet (${age}h old)"; fi
   fi
 
-  # NTM: present at the release tag, with every subcommand maybe_run_ntm calls
+  # NTM: present at the stable tag and at a newer prerelease, with every subcommand maybe_run_ntm
+  # calls (checking the prerelease warns before the updater ever needs that NTM)
   if [[ -n "$lt" ]] && [[ "$scope" == "all" || "${NTM_ENABLED:-0}" == "1" ]]; then
-    tmp="$(mktemp 2>/dev/null)" || return 1
-    if gcurl -fsSL --proto '=https' --retry 2 --max-time 120 -o "$tmp" "https://raw.githubusercontent.com/$REPO/$lt/$NTM_REPO_PATH" 2>/dev/null; then
-      miss=""
-      for c in $NTM_CMDS; do grep -qE "^[[:space:]]*\"?$c\"?[[:space:]]*(\)|\|)" "$tmp" || miss="$miss $c"; done
-      if [[ -n "$miss" ]]; then echo "WARN NTM: $lt NTM lacks subcommand(s):$miss"; warn=1
-      else echo "ok   NTM: $lt has all subcommands the updater calls"; fi
-    else
-      echo "WARN NTM: $NTM_REPO_PATH not found at $lt (moved?)"; warn=1
-    fi
-    rm -f "$tmp"
+    for t in $lt $( [[ -n "$ntag" && "$ntag" != "$lt" && "$ntag" == "$TAG_PREFIX"* ]] && echo "$ntag" ); do
+      tmp="$(mktemp 2>/dev/null)" || return 1
+      if gcurl -fsSL --proto '=https' --retry 2 --max-time 120 -o "$tmp" "https://raw.githubusercontent.com/$REPO/$t/$NTM_REPO_PATH" 2>/dev/null; then
+        miss=""
+        for c in $NTM_CMDS; do grep -qE "^[[:space:]]*\"?$c\"?[[:space:]]*(\)|\|)" "$tmp" || miss="$miss $c"; done
+        if [[ -n "$miss" ]]; then echo "WARN NTM: $t NTM lacks subcommand(s):$miss"; warn=1
+        else echo "ok   NTM: $t has all subcommands the updater calls"; fi
+      else
+        echo "WARN NTM: $NTM_REPO_PATH not found at $t (moved?)"; warn=1
+      fi
+      rm -f "$tmp"
+    done
   fi
   return "$warn"
 }
 
-# once a day from `run`: log the result; on WARN, alert (an unnoticed upstream change = no updates)
-doctor_daily() {
-  local last now out
-  last="$(cat "$DOCTOR_STATE" 2>/dev/null || echo 0)"; now="$(date -u +%s)"
-  [[ "$last" =~ ^[0-9]+$ ]] || last=0
-  (( now - last >= 86400 )) || return 0
-  printf '%s\n' "$now" > "$DOCTOR_STATE"
-  if out="$(doctor_checks relevant)"; then log "[doctor] upstream layout as expected"; return 0; fi
-  printf '%s\n' "$out" | sed 's/^/[doctor] /' >> "$LOGFILE" 2>/dev/null || true
-  log "[doctor] upstream changed; the updater may be skipping updates. Run: $DEST_PATH self-update"
-  notify failed "$(printf 'Upstream changed, updates may be skipped:\n%s\nTry: %s self-update' "$(printf '%s\n' "$out" | grep '^WARN')" "$DEST_PATH")"
+# From `run`: re-check when upstream publishes something new (a nym-node or bridge release,
+# prereleases included) and once more when the newest stable release is NTM_DOCS_WAIT_HOURS old
+# (its operator notes should exist by then). Alert only when the set of WARN lines changes, and
+# once when it clears - never repeatedly for the same problem.
+DOCTOR_WARNED="$STATE_DIR/doctor_warned"
+doctor_watch() {
+  local rels ntag lt pub age btag="-" key out warns real prev
+  rels="$(gh_releases "$REPO" 2>/dev/null)" || return 0
+  ntag="$(printf '%s' "$rels" | newest_node_tag)"
+  IFS=$'\t' read -r lt pub _ _ <<<"$(printf '%s' "$rels" | pick_latest "$TAG_PREFIX" "$ASSET" 2>/dev/null)" || true
+  age="$(age_hours "$pub" 2>/dev/null || echo 0)"
+  if [[ -n "${BRIDGE_UNIT:-}" ]]; then
+    btag="$(gh_releases "$BRIDGE_REPO" 2>/dev/null | newest_release "$BRIDGE_ASSET" 2>/dev/null | cut -f1)"
+    [[ -n "$btag" ]] || return 0
+  fi
+  # the script version is part of the key: a fixed script re-checks (and clears the alert) at once
+  key="$SCRIPT_VERSION ${ntag:--} ${lt:--} $btag $(( ${age:-0} >= NTM_DOCS_WAIT_HOURS ? 1 : 0 ))"
+  [[ "$key" != "$(cat "$DOCTOR_STATE" 2>/dev/null || true)" ]] || return 0
+
+  out="$(doctor_checks relevant)" || true
+  warns="$(printf '%s\n' "$out" | grep '^WARN' || true)"
+  real="$(printf '%s\n' "$warns" | grep -v -e 'unreachable' -e 'could not read' || true)"
+  if [[ -n "$warns" && -z "$real" ]]; then log "[doctor] GitHub did not answer; will retry next run"; return 0; fi
+  printf '%s\n' "$key" > "$DOCTOR_STATE"
+  prev="$(cat "$DOCTOR_WARNED" 2>/dev/null || true)"
+  if [[ -n "$real" ]]; then
+    printf '%s\n' "$out" | sed 's/^/[doctor] /' >> "$LOGFILE" 2>/dev/null || true
+    log "[doctor] upstream changed; the updater may be skipping updates. Run: $DEST_PATH self-update"
+    if [[ "$real" != "$prev" ]]; then
+      printf '%s\n' "$real" > "$DOCTOR_WARNED"
+      notify failed "$(printf 'Upstream changed, updates may be skipped:\n%s\nTry: %s self-update' "$real" "$DEST_PATH")"
+    fi
+  else
+    log "[doctor] upstream layout as expected (${ntag:-?}, bridge $btag)"
+    if [[ -n "$prev" ]]; then rm -f "$DOCTOR_WARNED"; notify success "Upstream check is all ok again"; fi
+  fi
 }
 
 # ------------------- changelog-driven operator actions ----------------------
@@ -1071,7 +1104,7 @@ cmd_run() {
     fi
   fi
 
-  doctor_daily || true
+  doctor_watch || true
 
   log "run complete (nym-node rc=$node_rc, nym-bridge rc=$bridge_rc, ntm rc=$ntm_rc, nym-api rc=$api_rc)"
   # read by cmd_poll for the bot: the box's main component (nym-node, or nym-api on an api-only box)

@@ -145,8 +145,8 @@ tunnel(NTM): nym-binaries-v2026.11-xynomizithra changelog has no tunnel/port cha
 ```
 
 Check that the updater still matches how Nym publishes releases (tag prefixes, the operator-notes path,
-NTM and its subcommands). One `ok` or `WARN` line per check; the hourly run does this once a day and
-alerts on `WARN`:
+NTM and its subcommands). One `ok` or `WARN` line per check. The hourly run does this by itself whenever
+Nym publishes a nym-node or bridge release (prereleases too) and alerts only when the result changes:
 
 ```bash
 sudo /usr/local/sbin/nym-node-autoupdate.sh doctor
