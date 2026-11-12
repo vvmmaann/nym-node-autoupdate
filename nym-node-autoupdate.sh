@@ -49,7 +49,8 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 
 # ------------------------------- configuration -------------------------------
 REPO="nymtech/nym";          TAG_PREFIX="nym-binaries-v";    ASSET="nym-node"
-BRIDGE_REPO="nymtech/nym-bridges"; BRIDGE_TAG_PREFIX="bridge-binaries-v"; BRIDGE_ASSET="nym-bridge"
+# nym-bridges tags were "bridge-binaries-v0.1.x" up to 0.1.2 and are plain "v0.2.2", "v0.3.0" since
+BRIDGE_REPO="nymtech/nym-bridges"; BRIDGE_TAG_PREFIX="v"; BRIDGE_ASSET="nym-bridge"
 NTM_REPO_PATH="scripts/nym-node-setup/network-tunnel-manager.sh"  # tunnel manager, from $REPO
 
 MIN_AGE_HOURS="${NYM_MIN_AGE_HOURS:-2}"     # ignore releases younger than this (soak delay)
@@ -92,8 +93,14 @@ API_DKG_CONTRACT="${NYM_API_DKG_CONTRACT:-n19604yflqggs9mk2z26mqygq43q2kr3n932eg
 API_LCDS="${NYM_API_LCDS:-http://127.0.0.1:1317 https://api.nymtech.net}"
 # operator-facing changelog (docs). the release git tag is cut BEFORE its docs section is written,
 # so the section is read from the docs branch, not the tag. official nym source, trusted.
-OP_CHANGELOG_PATH="documentation/docs/pages/operators/changelog.mdx"
+# the docs moved from pages/ to content/ on 2026-10-14 (nym PR #7198); the old path is kept as a fallback
+OP_CHANGELOG_PATHS="documentation/docs/content/operators/changelog.mdx documentation/docs/pages/operators/changelog.mdx"
 OP_CHANGELOG_REFS="${NYM_DOCS_REFS:-main develop}"
+# a release can be installed before its operator notes are written; while the notes are missing and the
+# tunnel is healthy, the tunnel decision is re-checked every run for up to this many hours
+NTM_DOCS_WAIT_HOURS="${NYM_NTM_DOCS_WAIT_HOURS:-48}"
+[[ "$NTM_DOCS_WAIT_HOURS" =~ ^[0-9]+$ ]] || NTM_DOCS_WAIT_HOURS=48
+NTM_DOCS_WAIT="$STATE_DIR/ntm_docs_wait"
 ACTIONS_STATE="$STATE_DIR/actions_last_tag"
 CHANGELOG_ACTIONS="${NYM_CHANGELOG_ACTIONS:-0}"   # 0 = report only (SAFE DEFAULT). Was 1; auto-eval of commands pulled from a mutable docs branch is a root-RCE risk (deny-list is bypassable), so it is OFF unless explicitly opted in.
 
@@ -109,7 +116,7 @@ NYMI_HUB_BASE="${NYM_NYMI_HUB:-https://nymcheckby.unclelem.uk/nymi}"
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.5.0"
 SELF_UPDATE_URL="${NYM_SELF_UPDATE_URL:-https://raw.githubusercontent.com/vvmmaann/nym-node-autoupdate/main/nym-node-autoupdate.sh}"
 
 # --------------------------------- logging ----------------------------------
@@ -425,6 +432,33 @@ is_healthy() {
   return 1
 }
 
+# bridge_listening <unit> <bin> - the bridge must listen on every port its config names. nym-bridge 0.3+
+# prints them with --print-ports; an older binary, an unreadable config or a host without ss skips the
+# check (returns 0), so it can only catch "service active but a transport did not come up".
+bridge_listening() {
+  local u="$1" b="$2" cfg ports port proto i miss
+  command -v ss >/dev/null 2>&1 || { log "  bridge port check skipped (no ss)"; return 0; }
+  cfg="$(sctl show -p ExecStart --value "$u" 2>/dev/null | grep -oE -- '--config[= ]+[^ ;]+' | head -n1 | sed -E 's/--config[= ]+//' || true)"
+  [[ -n "$cfg" ]] || cfg="/etc/nym/bridges.toml"
+  ports="$(timeout 10 "$b" --config "$cfg" --print-ports 2>/dev/null)" || { log "  bridge port check skipped (binary has no --print-ports, or $cfg unreadable)"; return 0; }
+  [[ -n "$ports" ]] || return 0
+  for i in 1 2 3 4 5 6; do
+    miss=""
+    while IFS=/ read -r port proto; do
+      [[ "$port" =~ ^[0-9]+$ ]] || continue
+      if [[ "$proto" == "udp" ]]; then
+        ss -lnu "sport = :$port" 2>/dev/null | tail -n +2 | grep -q . || miss="$miss $port/udp"
+      else
+        ss -lnt "sport = :$port" 2>/dev/null | tail -n +2 | grep -q . || miss="$miss $port/tcp"
+      fi
+    done <<< "$ports"
+    [[ -z "$miss" ]] && { log "  bridge listening on: $(printf '%s ' $ports)"; return 0; }
+    sleep 5
+  done
+  log "  bridge not listening on:$miss"
+  return 1
+}
+
 # ------------------------------ nym-api checks ------------------------------
 api_get() { curl -fsS --max-time 8 "${API_URL}$1" 2>/dev/null; }
 # "isEcashSigner hasSigningKeys signerDisabled", e.g. "true true false"; empty if it does not answer
@@ -654,7 +688,8 @@ update_component() {
     sctl start "$CUNIT" || log "[$NAME] warning: start returned non-zero"
 
     if is_healthy "$CUNIT" "$CBIN" "$newver" \
-       && { [[ "$NAME" != "nym-api" ]] || api_http_healthy "$newver" "$api_before"; }; then
+       && { [[ "$NAME" != "nym-api" ]] || api_http_healthy "$newver" "$api_before"; } \
+       && { [[ "$NAME" != "nym-bridge" ]] || bridge_listening "$CUNIT" "$CBIN"; }; then
       printf '%s\n' "$tag" > "$CSTATE"
       log "[$NAME] SUCCESS: $CUNIT healthy on ${newver:-$tag}"
       notify success "$NAME updated to ${newver:-$tag} and healthy"
@@ -688,17 +723,19 @@ update_component() {
 # Docs headings look like:  ## `v2026.15-bydgoszcz`   (the leading char before v is a backtick,
 # matched here with '.'). Tries each docs branch in turn.
 op_changelog_section() {   # arg: version (tag minus TAG_PREFIX)
-  local ver="$1" ref cl section
+  local ver="$1" ref path cl section
   for ref in $OP_CHANGELOG_REFS; do
-    cl="$(curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --retry 2 --max-time 60 \
-          "https://raw.githubusercontent.com/$REPO/$ref/$OP_CHANGELOG_PATH" 2>/dev/null)" \
-      || cl="$(curl -4 -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --retry 2 --max-time 60 \
-          "https://raw.githubusercontent.com/$REPO/$ref/$OP_CHANGELOG_PATH" 2>/dev/null)" || continue
-    section="$(printf '%s\n' "$cl" | awk -v pat="^## .v${ver}([^A-Za-z0-9]|$)" '
-      $0 ~ pat {f=1; print; next}
-      f && /^## .v20/ {exit}
-      f {print}')"
-    [[ -n "$section" ]] && { printf '%s\n' "$section"; return 0; }
+    for path in $OP_CHANGELOG_PATHS; do
+      cl="$(curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --retry 2 --max-time 60 \
+            "https://raw.githubusercontent.com/$REPO/$ref/$path" 2>/dev/null)" \
+        || cl="$(curl -4 -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --retry 2 --max-time 60 \
+            "https://raw.githubusercontent.com/$REPO/$ref/$path" 2>/dev/null)" || continue
+      section="$(printf '%s\n' "$cl" | awk -v pat="^## .v${ver}([^A-Za-z0-9]|$)" '
+        $0 ~ pat {f=1; print; next}
+        f && /^## .v20/ {exit}
+        f {print}')"
+      [[ -n "$section" ]] && { printf '%s\n' "$section"; return 0; }
+    done
   done
   return 1
 }
@@ -759,8 +796,26 @@ maybe_run_ntm() {
   if matched="$(changelog_mentions_ntm "$tag")"; then crc=0; else crc=$?; fi
   if   (( crc == 0 )); then mentioned=1; log "[ntm] changelog for $tag mentions tunnel/ports:"; printf '%s\n' "$matched" | sed 's/^/[ntm]   /' >> "$LOGFILE" 2>/dev/null || true
   elif (( crc == 1 )); then log "[ntm] changelog for $tag has no tunnel/port changes"
-  else                       log "[ntm] could not read changelog for $tag; deciding on self-test only"; fi
-  log "[ntm] changelog: https://github.com/$REPO/blob/$tag/CHANGELOG.md"
+  else                       log "[ntm] could not read the operator notes for $tag"; fi
+
+  # notes not published yet: if the tunnel works, wait for them (a "re-run NTM" note may still come)
+  if (( crc == 2 )); then
+    if ntm_selftest "$iface"; then
+      local wtag="" wfirst="" now waited
+      read -r wtag wfirst 2>/dev/null < "$NTM_DOCS_WAIT" || true
+      now="$(date -u +%s)"
+      if [[ "$wtag" != "$tag" || ! "$wfirst" =~ ^[0-9]+$ ]]; then wfirst="$now"; printf '%s %s\n' "$tag" "$now" > "$NTM_DOCS_WAIT"; fi
+      waited=$(( (now - wfirst) / 3600 ))
+      if (( waited < NTM_DOCS_WAIT_HOURS )); then
+        log "[ntm] tunnel healthy; no operator notes for $tag yet, will check again next run (waited ${waited}h of max ${NTM_DOCS_WAIT_HOURS}h)"
+        return 0
+      fi
+      log "[ntm] still no operator notes for $tag after ${waited}h; deciding on the self-test only"
+    else
+      log "[ntm] no operator notes for $tag and the tunnel is not egressing; applying now"
+    fi
+  fi
+  rm -f "$NTM_DOCS_WAIT" 2>/dev/null || true
 
   local tmp rc=0
   tmp="$(mktemp -d "$STATE_DIR/ntm.XXXXXX" 2>/dev/null)" || { log "[ntm] mktemp failed; skip"; return 0; }

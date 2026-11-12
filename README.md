@@ -20,13 +20,18 @@ demand. See [Nymi (Telegram alerts)](#nymi-telegram-alerts) below. **The node ne
   `github.com/nymtech/nym` (tags `nym-binaries-v*`), SHA-256 verified against the release `hashes.json`.
 - **`nym-bridge`** (the Nym QUIC Bridge) - **gateways only**. It is a separate component with its own
   release line, so the script updates it too, but only when `nym-bridge.service` is present on the host.
-  Source: `github.com/nymtech/nym-bridges` (tags `bridge-binaries-v*`). Those releases ship no checksum
+  Source: `github.com/nymtech/nym-bridges` (tags `v*`; up to 0.1.2 they were `bridge-binaries-v*`). Those releases ship no checksum
   file, so the bridge binary is verified by HTTPS + a smoke test rather than SHA-256, and swapped with
-  the same backup/rollback machinery as `nym-node`. A mixnode has no bridge, so this step is skipped.
+  the same backup/rollback machinery as `nym-node`. After the swap the bridge must listen on every port
+  its config names (`nym-bridge --print-ports`, 0.3+), or it is rolled back. Only the binary is replaced:
+  the TLS and SSH transports of 0.3.0 are not switched on (that changes `bridges.toml` and the firewall;
+  use the official `upgrade-nym-bridge.sh` for it). A mixnode has no bridge, so this step is skipped.
 - **Network Tunnel Manager (NTM)** - **exit gateways only**. This is `network-tunnel-manager.sh`
   (a script, not a binary) that sets up the gateway's iptables / forwarding / tunnel rules. After a
-  `nym-node` release the updater reads **only that release's CHANGELOG.md section** as a *signal* - it
-  never executes the changelog as instructions. If the section mentions tunnel / ports / firewall /
+  `nym-node` release the updater reads **only that release's section of the operator changelog**
+  (`documentation/docs/content/operators/changelog.mdx`) as a *signal* - it never executes it as
+  instructions. Nym often writes that section after the release, so while it is missing and the tunnel
+  works, the check is repeated every run for up to 48h. If the section mentions tunnel / ports / firewall /
   wireguard (or if a tunnel self-test fails), it fetches the **tag-matched** NTM from `nymtech/nym`
   (`scripts/nym-node-setup/network-tunnel-manager.sh`), runs its own `apply_iptables_rules*` +
   `remove_duplicate_rules`, and gates the result on a **real egress probe** (a packet sourced from the
@@ -135,7 +140,7 @@ Example output:
 
 ```
 nym-node   : up to date (1.33.0, nym-binaries-v2026.11-xynomizithra)
-nym-bridge : UPDATE AVAILABLE -> bridge-binaries-v0.1.3   (last applied bridge-binaries-v0.1.2)
+nym-bridge : UPDATE AVAILABLE -> v0.3.0   (last applied bridge-binaries-v0.1.2)
 tunnel(NTM): nym-binaries-v2026.11-xynomizithra changelog has no tunnel/port changes
 ```
 

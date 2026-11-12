@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.5.0 - 2026-11-12
+
+The QUIC bridge and the "re-run NTM" notes are picked up again.
+
+- **Bridge releases found again.** nym-bridges changed its tags from `bridge-binaries-v0.1.x` to `v0.2.2`,
+  `v0.3.0`, so the updater stopped seeing new bridge releases after 0.1.2. It now takes `v*` tags
+  (prereleases are still skipped), so gateways move to 0.3.0.
+- **Only the bridge binary is replaced.** QUIC, its port and its key stay as they are, as with the
+  official `upgrade-nym-bridge.sh --no-tls-ssh`. TLS and SSH are not switched on: that edits
+  `bridges.toml` and the firewall, so run the official script for it.
+- **Bridge port check.** After the swap the bridge must listen on every port its config names
+  (`nym-bridge --print-ports`, 0.3+), otherwise the old binary is put back.
+- **Operator notes found again.** On 2026-10-14 the Nym docs moved from `pages/` to `content/`, so the
+  updater could no longer read the operator changelog and decided about NTM on the tunnel self-test
+  only. It reads the new path now (the old one stays as a fallback).
+- **Waits for late notes.** A release can be installed before its operator notes are written. While
+  they are missing and the tunnel works, the NTM decision is checked again every run for up to 48h,
+  so a "re-run NTM" note published later is still acted on.
+
+Update with `sudo /usr/local/sbin/nym-node-autoupdate.sh self-update`.
+
 ## 1.4.0 - 2026-10-21
 
 Quiet gate: a mixnode is updated only while it is idle. Idea from Andrew in the operators chat.
