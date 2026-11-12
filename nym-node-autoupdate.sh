@@ -116,7 +116,7 @@ NYMI_HUB_BASE="${NYM_NYMI_HUB:-https://nymcheckby.unclelem.uk/nymi}"
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.6.0"
 SELF_UPDATE_URL="${NYM_SELF_UPDATE_URL:-https://raw.githubusercontent.com/vvmmaann/nym-node-autoupdate/main/nym-node-autoupdate.sh}"
 
 # --------------------------------- logging ----------------------------------
@@ -889,6 +889,95 @@ maybe_run_ntm() {
   return "$rc"
 }
 
+# ------------------------- doctor: upstream drift check ----------------------
+# The updater relies on how Nym publishes things: release tag prefixes and asset names, the path of
+# the operator notes, the NTM path and its subcommands. Two of these changed in 2026 (bridge tags at
+# 0.2, the docs path on 2026-10-14) and each time the updater just went quiet, with no error.
+# doctor checks every one of these against GitHub. stdout: one "ok"/"WARN" line per check.
+# arg: all | relevant (relevant = skip the bridge/NTM checks on a box without them). return 1 on WARN.
+NTM_CMDS="adjust_ip_forwarding apply_iptables_rules apply_iptables_rules_wg configure_dns_and_icmp_wg remove_duplicate_rules"
+DOCTOR_STALE_DAYS=45          # Nym ships a nym-node release every 2-3 weeks
+DOCTOR_STATE="$STATE_DIR/doctor_last"
+
+# newest non-draft release (prereleases included) as "tag<TAB>published<TAB>has_asset(true|false)"
+newest_release() {        # stdin: releases JSON ; arg: asset
+  jq -r --arg a "$1" '[.[] | select(.draft==false)] | sort_by(.published_at) | reverse | .[0] // empty
+    | "\(.tag_name)\t\(.published_at)\t\(any(.assets[]?; .name==$a))"'
+}
+
+doctor_checks() {
+  local scope="${1:-all}" warn=0 rels lt pub age tag hasa ref path reach=0 tmp c miss
+  # nym-node: the newest release that ships nym-node must carry our tag prefix, and the newest
+  # stable one must not be stale (a renamed tag or asset shows up as "nothing new for weeks")
+  if rels="$(gh_releases "$REPO" 2>/dev/null)"; then
+    tag="$(printf '%s' "$rels" | jq -r --arg a "$ASSET" '[.[] | select(.draft==false) | select(any(.assets[]?; .name==$a))]
+             | sort_by(.published_at) | reverse | .[0].tag_name // empty' 2>/dev/null || true)"
+    IFS=$'\t' read -r lt pub _ _ <<<"$(printf '%s' "$rels" | pick_latest "$TAG_PREFIX" "$ASSET" 2>/dev/null)" || true
+    if [[ -z "$tag" ]]; then echo "WARN nym-node: no recent nymtech/nym release ships an asset named '$ASSET'"; warn=1
+    elif [[ "$tag" != "$TAG_PREFIX"* ]]; then echo "WARN nym-node: newest release with '$ASSET' is tagged '$tag', not '$TAG_PREFIX*'"; warn=1
+    elif [[ -z "$lt" ]]; then echo "WARN nym-node: no stable '$TAG_PREFIX*' release with '$ASSET'"; warn=1
+    else
+      age="$(age_hours "$pub" 2>/dev/null || echo 0)"
+      if (( age > DOCTOR_STALE_DAYS * 24 )); then echo "WARN nym-node: newest stable release $lt is $((age / 24)) days old"; warn=1
+      else echo "ok   nym-node: newest stable $lt"; fi
+    fi
+  else
+    echo "WARN nym-node: GitHub API unreachable"; return 1
+  fi
+
+  # nym-bridge: the newest release of any kind must carry our prefix and ship our asset
+  if [[ "$scope" == "all" || -n "${BRIDGE_UNIT:-}" ]]; then
+    IFS=$'\t' read -r tag pub hasa <<<"$(gh_releases "$BRIDGE_REPO" 2>/dev/null | newest_release "$BRIDGE_ASSET" 2>/dev/null)" || true
+    if   [[ -z "$tag" ]]; then echo "WARN nym-bridge: could not read $BRIDGE_REPO releases"; warn=1
+    elif [[ "$tag" != "$BRIDGE_TAG_PREFIX"* ]]; then echo "WARN nym-bridge: newest release is tagged '$tag', not '$BRIDGE_TAG_PREFIX*'"; warn=1
+    elif [[ "$hasa" != "true" ]]; then echo "WARN nym-bridge: newest release $tag has no asset named '$BRIDGE_ASSET'"; warn=1
+    else echo "ok   nym-bridge: newest release $tag"; fi
+  fi
+
+  # operator notes: the file must be at a known path, and once a release is older than the docs
+  # wait it must have its own section (a missing section past that = moved file or new heading format)
+  for ref in $OP_CHANGELOG_REFS; do
+    for path in $OP_CHANGELOG_PATHS; do
+      curl -fsS -o /dev/null --proto '=https' --connect-timeout 8 --max-time 60 \
+        "https://raw.githubusercontent.com/$REPO/$ref/$path" 2>/dev/null && { reach=1; break 2; }
+    done
+  done
+  if (( reach == 0 )); then echo "WARN operator notes: not found at any known path (docs moved?)"; warn=1
+  elif [[ -n "$lt" ]]; then
+    if op_changelog_section "${lt#${TAG_PREFIX}}" >/dev/null; then echo "ok   operator notes: section for $lt found"
+    elif (( ${age:-0} >= NTM_DOCS_WAIT_HOURS )); then echo "WARN operator notes: no section for $lt, released ${age}h ago (heading format changed?)"; warn=1
+    else echo "ok   operator notes: file found, section for $lt not written yet (${age}h old)"; fi
+  fi
+
+  # NTM: present at the release tag, with every subcommand maybe_run_ntm calls
+  if [[ -n "$lt" ]] && [[ "$scope" == "all" || "${NTM_ENABLED:-0}" == "1" ]]; then
+    tmp="$(mktemp 2>/dev/null)" || return 1
+    if gcurl -fsSL --proto '=https' --retry 2 --max-time 120 -o "$tmp" "https://raw.githubusercontent.com/$REPO/$lt/$NTM_REPO_PATH" 2>/dev/null; then
+      miss=""
+      for c in $NTM_CMDS; do grep -qE "^[[:space:]]*\"?$c\"?[[:space:]]*(\)|\|)" "$tmp" || miss="$miss $c"; done
+      if [[ -n "$miss" ]]; then echo "WARN NTM: $lt NTM lacks subcommand(s):$miss"; warn=1
+      else echo "ok   NTM: $lt has all subcommands the updater calls"; fi
+    else
+      echo "WARN NTM: $NTM_REPO_PATH not found at $lt (moved?)"; warn=1
+    fi
+    rm -f "$tmp"
+  fi
+  return "$warn"
+}
+
+# once a day from `run`: log the result; on WARN, alert (an unnoticed upstream change = no updates)
+doctor_daily() {
+  local last now out
+  last="$(cat "$DOCTOR_STATE" 2>/dev/null || echo 0)"; now="$(date -u +%s)"
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  (( now - last >= 86400 )) || return 0
+  printf '%s\n' "$now" > "$DOCTOR_STATE"
+  if out="$(doctor_checks relevant)"; then log "[doctor] upstream layout as expected"; return 0; fi
+  printf '%s\n' "$out" | sed 's/^/[doctor] /' >> "$LOGFILE" 2>/dev/null || true
+  log "[doctor] upstream changed; the updater may be skipping updates. Run: $DEST_PATH self-update"
+  notify failed "$(printf 'Upstream changed, updates may be skipped:\n%s\nTry: %s self-update' "$(printf '%s\n' "$out" | grep '^WARN')" "$DEST_PATH")"
+}
+
 # ------------------- changelog-driven operator actions ----------------------
 # Pull runnable shell lines out of the fenced code blocks of a changelog section.
 # Only bash/sh/shell/console blocks; skip comments, blanks, and leading "$ " prompts.
@@ -980,6 +1069,8 @@ cmd_run() {
       update_api || api_rc=$?
     fi
   fi
+
+  doctor_daily || true
 
   log "run complete (nym-node rc=$node_rc, nym-bridge rc=$bridge_rc, ntm rc=$ntm_rc, nym-api rc=$api_rc)"
   # read by cmd_poll for the bot: the box's main component (nym-node, or nym-api on an api-only box)
@@ -1410,13 +1501,14 @@ main() {
     install)   need_root "$@"; require_cmds curl jq sha256sum; cmd_install ;;
     uninstall) need_root "$@"; cmd_uninstall ;;
     check)     require_cmds curl jq; cmd_check ;;
+    doctor)    require_cmds curl jq; doctor_checks all; exit $? ;;
     status)    cmd_status ;;
     pair)      require_cmds curl; cmd_pair "${2:-}" "${3:-}" ;;
     link)      cmd_link ;;
     poll)      need_root "$@"; require_cmds curl jq sha256sum flock; cmd_poll ;;
     self-update|selfupdate|update-self) cmd_self_update "$@" ;;
     version|--version|-v) echo "nym-node-autoupdate $SCRIPT_VERSION" ;;
-    *) echo "usage: $0 {install|run|check|status|pair|self-update|version|poll|uninstall}"; exit 1 ;;
+    *) echo "usage: $0 {install|run|check|doctor|status|pair|self-update|version|poll|uninstall}"; exit 1 ;;
   esac
 }
 main "$@"

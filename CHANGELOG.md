@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.6.0 - 2026-11-12
+
+`doctor`: a check that the updater still matches how Nym publishes releases.
+
+Two upstream changes this year (bridge tags at 0.2, the docs path in October) made the updater skip
+updates without any error. `doctor` checks each thing it relies on, against GitHub:
+
+- the newest nym-node release uses the `nym-binaries-v` tag prefix, and a stable one is not older than 45 days;
+- the newest nym-bridges release uses the `v` prefix and ships `nym-bridge`;
+- the operator notes are at a known path and have a section for the current release (48h after it);
+- NTM is at its path in the release and has every subcommand the updater calls.
+
+`sudo /usr/local/sbin/nym-node-autoupdate.sh doctor` prints one `ok` or `WARN` line per check. The hourly
+run also does it once a day (bridge and NTM checks only where they apply) and sends a Telegram alert on
+`WARN`, if alerts are set up.
+
+Update with `sudo /usr/local/sbin/nym-node-autoupdate.sh self-update`.
+
 ## 1.5.0 - 2026-11-12
 
 The QUIC bridge and the "re-run NTM" notes are picked up again.

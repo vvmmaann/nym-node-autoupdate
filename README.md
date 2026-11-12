@@ -144,6 +144,14 @@ nym-bridge : UPDATE AVAILABLE -> v0.3.0   (last applied bridge-binaries-v0.1.2)
 tunnel(NTM): nym-binaries-v2026.11-xynomizithra changelog has no tunnel/port changes
 ```
 
+Check that the updater still matches how Nym publishes releases (tag prefixes, the operator-notes path,
+NTM and its subcommands). One `ok` or `WARN` line per check; the hourly run does this once a day and
+alerts on `WARN`:
+
+```bash
+sudo /usr/local/sbin/nym-node-autoupdate.sh doctor
+```
+
 Force an update check **and apply** right now (this is what the hourly timer runs):
 
 ```bash
