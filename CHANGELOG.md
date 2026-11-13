@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.9.3 - 2026-11-13
+
+Roles follow Nym's table (operators docs, Ansible deploy).
+
+- **NTM** runs on exit gateways and on entry gateways with WireGuard, never on mixnodes. The mode
+  comes from the node's API on every run (`/api/v1/roles`, `/api/v1/gateway/client-interfaces`), not
+  from the `nymtun0` interface. A WireGuard entry gateway is probed on `nymwg`. Nym's NTM needs both
+  `nymtun0` and `nymwg`; without both it is not run, and that is reported once. `NTM_ENABLED=0` still
+  turns it off. `status`, `check` and `doctor` look at NTM only where it applies.
+- **Entry gateway without WireGuard:** where ufw is active, the bridge and Lewes Protocol ports are
+  opened in it (4443/tcp, 4443/udp, 4422/tcp, 41264/tcp, 51264/udp), only in the address family that
+  has no rule for them. A port a ufw rule closes, or allows only for some sources or an interface, is
+  left alone and reported. `UFW_PORTS_ENABLED=0` turns this off.
+- **Switches:** only `1` turns `NTM_ENABLED` or `UFW_PORTS_ENABLED` on; any other value is off, as
+  `NTM_ENABLED` always worked.
+- **Re-install** keeps `NTM_ENABLED=0`, `UFW_PORTS_ENABLED`, `NTM_INPUT_POLICY`, `NODE_HTTP` and the
+  Telegram settings from the config. The old config is read the way `run` reads it, only when it is
+  root-owned and not writable by others, and each value is checked before it is saved again.
+- **Bridge port check** reads `ufw status verbose` where ufw is active (app profiles included, such as
+  the one nym-bridge adds); where no ufw rule decides and ufw drops by default, the INPUT rules after
+  ufw's decide.
+
 ## 1.9.2 - 2026-11-13
 
 - **NTM.** Nothing is applied without a complete firewall snapshot (v4, v6 and the saved rule files). A

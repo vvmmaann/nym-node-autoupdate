@@ -31,13 +31,18 @@ demand. See [Nymi (Telegram alerts)](#nymi-telegram-alerts) below. **The node ne
   both, by role, with Nym's own scripts, as an operator would by hand. Anything else the notes list
   (config edits, placeholders like `<PORT>`, ansible variants) is never executed: it is sent to you as
   manual steps.
-- **Network Tunnel Manager (NTM)** - **exit gateways only** (detected via `nymtun0`). The notes say:
-  take `network-tunnel-manager.sh` from `nymtech/nym` develop and run `complete_networking_configuration`.
+- **Network Tunnel Manager (NTM)** - where Nym runs it: **exit gateways and entry gateways with
+  WireGuard**, never mixnodes ([Nym's role table](https://nym.com/docs/operators/orchestration/ansible)).
+  The mode is read from the node's own API on every run. The notes say: take
+  `network-tunnel-manager.sh` from `nymtech/nym` develop and run `complete_networking_configuration`.
+  Nym's NTM sets up and tests both `nymtun0` and `nymwg` and stops when either is missing, so it is
+  not run without both; you are told once.
   - **When it runs:** when that script gets a new commit upstream (2h old; NIP exit-policy votes arrive
     this way), or when the current release's notes ask for a re-run.
   - **How:** pinned to the commit, with the firewall snapshotted first.
   - **Checks after the run:**
-    - the tunnel egresses and nym-node is up;
+    - the tunnel egresses (`nymtun0` on an exit gateway, `nymwg` on a WireGuard entry gateway) and
+      nym-node is up;
     - the SSH port is let in;
     - the exit policy holds every port of the script's list (tcp and udp, v4 and v6);
     - the rules are saved for reboot.
@@ -46,6 +51,11 @@ demand. See [Nymi (Telegram alerts)](#nymi-telegram-alerts) below. **The node ne
   - **Host firewall:** NTM drops inbound traffic it does not list. Where the INPUT policy was ACCEPT,
     services already listening on the host get an ACCEPT at the end of INPUT, so they stay reachable as
     before. `NTM_INPUT_POLICY=KEEP` in the config leaves the policy alone.
+- **ufw on an entry gateway without WireGuard** - NTM does not run there, the host keeps ufw. As in
+  Nym's deploy, the bridge and Lewes Protocol ports are opened in ufw when it is active: 4443/tcp,
+  4443/udp, 4422/tcp, 41264/tcp, 51264/udp. A port a ufw rule closes is left alone and reported.
+  A port the operator allows only for some sources or an interface is not opened to everyone.
+  `UFW_PORTS_ENABLED=0` in the config turns this off.
 - **Bridge TLS/SSH** - **gateways with a bridge 0.3.0 or newer**. The notes ask to re-run the bridge
   setup.
   - **How:** the updater runs Nym's `quic_bridge_deployment.sh` from develop (pinned to its commit)
@@ -286,7 +296,7 @@ needed). `check`/`status` are read-only and need no root.
   reduces to "GitHub + the nymtech release account are uncompromised", same as a manual install.
 - **nym-bridge** ships no upstream checksum: updates are trusted on HTTPS + GitHub release integrity
   only (verified by a smoke-test, swapped with the same backup/rollback as nym-node).
-- **NTM** (exit gateways) is fetched from the nym repo's **develop** branch, as the operator notes
+- **NTM** (exit and WireGuard entry gateways) is fetched from the nym repo's **develop** branch, as the operator notes
   instruct, **pinned to the commit SHA** it resolves (never the branch name) and **run as root**.
   There is no upstream checksum or signature, so this trusts the integrity of the nym GitHub org and
   its develop branch, the same as running their documented tunnel setup by hand. Set

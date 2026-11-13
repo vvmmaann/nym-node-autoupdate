@@ -9,7 +9,9 @@
 #   * nym-bridge - the QUIC bridge, GATEWAYS ONLY (only if nym-bridge.service exists).
 #                  Source: github.com/nymtech/nym-bridges. Ships NO upstream checksum, so it is
 #                  trusted on HTTPS + GitHub release integrity only (no independent verification).
-#   * NTM        - the exit-gateway tunnel rules (network-tunnel-manager.sh), EXIT GATEWAYS ONLY.
+#   * NTM        - the gateway tunnel + firewall rules (network-tunnel-manager.sh), where Nym runs it:
+#                  exit gateways and WireGuard entry gateways. An entry gateway without WireGuard
+#                  keeps ufw; Nym's bridge and Lewes Protocol ports are opened there.
 #                  Fetched from github.com/nymtech/nym and RUN AS ROOT. There is no upstream
 #                  checksum/signature; this trusts the integrity of the nym GitHub org, the same
 #                  as running their documented install by hand. Set NTM_ENABLED=0 to opt out.
@@ -94,6 +96,7 @@ BRIDGE_STATE_TAG="$STATE_DIR/bridge_last_tag"; BRIDGE_FAILED_TAGS="$STATE_DIR/br
 NTM_STATE="$STATE_DIR/ntm_last_tag"
 NTM_REF_STATE="$STATE_DIR/ntm_applied_ref"        # NTM commit applied here
 NTM_FAILED_STATE="$STATE_DIR/ntm_failed_ref"      # NTM commit that failed here and was rolled back
+NTM_IFACE_STATE="$STATE_DIR/ntm_iface_missing"    # a missing tunnel interface, already reported
 API_ASSET="nym-api"
 API_STATE_TAG="$STATE_DIR/api_last_tag";       API_FAILED_TAGS="$STATE_DIR/api_failed_tags"
 # DKG contract on Nyx mainnet: a signer is not restarted while a ceremony is running
@@ -124,7 +127,7 @@ NYMI_HUB_BASE="${NYM_NYMI_HUB:-https://nymcheckby.unclelem.uk/nymi}"
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
-SCRIPT_VERSION="1.9.2"
+SCRIPT_VERSION="1.9.3"
 SELF_UPDATE_URL="${NYM_SELF_UPDATE_URL:-https://raw.githubusercontent.com/vvmmaann/nym-node-autoupdate/main/nym-node-autoupdate.sh}"
 
 # --------------------------------- logging ----------------------------------
@@ -242,14 +245,39 @@ detect_role() {
     *)                              echo "node (role set in config [modes])" ;;
   esac
 }
-# NTM is enabled ONLY when the live tunnel interface exists (a leftover script file is just a path hint,
-# never an enable signal - otherwise a former-gateway-now-mixnode would run tunnel apply on a dead iface).
+# Nym's rule (operators docs, Ansible deploy): NTM runs on exit gateways and on entry gateways with
+# WireGuard; never on mixnodes, and not on entry gateways without WireGuard (those keep ufw). The mode
+# comes from the node itself: /api/v1/roles (exit = ip_packet_router_enabled, entry = gateway_enabled)
+# and client-interfaces (wireguard is null when it is off). stdout: exit | entry-wg | entry | mixnode
+node_mode() {
+  local r w
+  r="$(curl -fsS --max-time 5 "$NODE_HTTP/api/v1/roles" 2>/dev/null)" || return 1
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$r" || return 1
+  if jq -e '.mixnode_enabled == true' >/dev/null 2>&1 <<<"$r"; then echo mixnode
+  elif jq -e '.ip_packet_router_enabled == true' >/dev/null 2>&1 <<<"$r"; then echo exit
+  elif jq -e '.gateway_enabled == true' >/dev/null 2>&1 <<<"$r"; then
+    w="$(curl -fsS --max-time 5 "$NODE_HTTP/api/v1/gateway/client-interfaces" 2>/dev/null)" || return 1
+    jq -e 'type == "object"' >/dev/null 2>&1 <<<"$w" || return 1
+    if jq -e '.wireguard != null' >/dev/null 2>&1 <<<"$w"; then echo entry-wg; else echo entry; fi
+  else return 1; fi
+}
+# NTM applies to this node: not turned off, and an exit or WireGuard entry gateway. stdout: the mode
+ntm_mode() {
+  local m
+  [[ "${NTM_ENABLED:-0}" == 1 ]] && m="$(node_mode)" && [[ "$m" == exit || "$m" == entry-wg ]] || return 1
+  printf '%s\n' "$m"
+}
+# Nym's NTM sets up and tests both nymtun0 and nymwg and stops when either is missing. stdout: the missing
+ntm_missing_ifaces() {
+  local t
+  for t in "${NTM_IFACE:-nymtun0}" nymwg; do ip link show "$t" >/dev/null 2>&1 || printf ' %s' "$t"; done
+}
+# NTM_ENABLED=0 in the config turns the NTM step off; otherwise node_mode decides on every run.
 detect_ntm() {            # echoes "<enabled>\t<path>\t<iface>"
-  local en=0 path="" iface="nymtun0"
-  ip link show "$iface" >/dev/null 2>&1 && en=1
+  local path=""
   path="$(ls -1 /usr/local/sbin/network-tunnel-manager.sh /root/network-tunnel-manager.sh /root/network_tunnel_manager.sh 2>/dev/null | head -n1 || true)"
   [[ -n "$path" ]] || path="/usr/local/sbin/network-tunnel-manager.sh"
-  printf '%s\t%s\t%s\n' "$en" "$path" "$iface"
+  printf '1\t%s\tnymtun0\n' "$path"
 }
 # Best-effort detection of the host SSH port, so an NTM firewall apply never locks the operator
 # out on a non-standard port. Prefers sshd's own effective config, then a listening sshd socket,
@@ -311,6 +339,9 @@ resolve_target() {
   if [[ -n "${BRIDGE_UNIT:-}" && -z "${BRIDGE_BIN:-}" ]]; then BRIDGE_BIN="$(detect_bridge_bin "$BRIDGE_UNIT")"; fi
   [[ -n "${ROLE:-}" ]]        || ROLE="$(detect_role "$UNIT")"
   if [[ -z "${NTM_ENABLED:-}" ]]; then IFS=$'\t' read -r NTM_ENABLED NTM_PATH NTM_IFACE < <(detect_ntm) || true; fi
+  # only "1" turns a step on (NTM_ENABLED has meant this since it exists); anything else is off
+  if [[ "${NTM_ENABLED:-}" != 1 ]]; then NTM_ENABLED=0; fi
+  if [[ "${UFW_PORTS_ENABLED:-1}" == 1 ]]; then UFW_PORTS_ENABLED=1; else UFW_PORTS_ENABLED=0; fi
   [[ -n "${NTM_IFACE:-}" ]] || NTM_IFACE="nymtun0"
   [[ "$NTM_IFACE" =~ ^[a-zA-Z0-9._-]+$ ]] || NTM_IFACE="nymtun0"   # sanity: never let junk reach iptables/ip
   [[ -n "${NTM_PATH:-}" ]]  || NTM_PATH="/usr/local/sbin/network-tunnel-manager.sh"
@@ -328,7 +359,8 @@ save_config() {
   cat > "$CONFIG_FILE" <<EOF
 # nym-node-autoupdate config - written by 'install', read on every run.
 # Edit by hand if your setup changes, or re-run: $DEST_PATH install
-# Leave BRIDGE_UNIT empty to disable QUIC-bridge updates; set NTM_ENABLED=0 to disable tunnel checks.
+# Leave BRIDGE_UNIT empty to disable QUIC-bridge updates; NTM_ENABLED=0 turns the NTM step off
+# (otherwise NTM follows the node's mode: exit and WireGuard entry gateways only).
 UNIT="$1"
 BIN="$2"
 SVC_USER="$3"
@@ -355,6 +387,10 @@ QUIET_GATE="$QUIET_GATE"
 QUIET_PPS="$QUIET_PPS"
 QUIET_MAX_HOURS="$QUIET_MAX_HOURS"
 NODE_HTTP="$NODE_HTTP"
+# NTM_INPUT_POLICY = NTM's HOST_INPUT_POLICY: DROP (its default) | KEEP.
+# UFW_PORTS_ENABLED=0 leaves ufw alone on an entry gateway without WireGuard.
+NTM_INPUT_POLICY="$NTM_INPUT_POLICY"
+UFW_PORTS_ENABLED="$UFW_PORTS_ENABLED"
 EOF
   chmod 0600 "$CONFIG_FILE"
 }
@@ -907,9 +943,18 @@ ssh_allowed() {           # arg: iptables|ip6tables ; INPUT lets a new SSH conne
 # (NIP exit-policy votes arrive that way) or when the current release's notes ask for it.
 # Snapshot of the firewall before; checks after (exit code, egress, nym-node, SSH, the exit policy
 # holds every port of the applied NTM); any failure restores the snapshot. NEVER aborts the run.
+# Only where Nym runs NTM (node_mode): exit gateways, probed on nymtun0, and WireGuard entry
+# gateways, probed on nymwg. Nym's NTM sets up and tests both nymtun0 and nymwg and stops when either
+# is missing, so it is not run without both; that is reported once.
 maybe_run_ntm() {
-  [[ "${NTM_ENABLED:-0}" == "1" ]] || return 0
-  local iface="${NTM_IFACE:-nymtun0}" dest="${NTM_PATH:-/usr/local/sbin/network-tunnel-manager.sh}"
+  [[ "${NTM_ENABLED:-0}" == 1 ]] || return 0
+  local mode iface dest="${NTM_PATH:-/usr/local/sbin/network-tunnel-manager.sh}"
+  mode="$(node_mode)" || { log "[ntm] nym-node at $NODE_HTTP did not report its mode; NTM step skipped this run"; return 0; }
+  case "$mode" in
+    exit)     iface="${NTM_IFACE:-nymtun0}" ;;
+    entry-wg) iface="nymwg" ;;
+    *)        return 0 ;;
+  esac
   local tag ref="" rdate="" applied failed why="" matched crc age tmp t f ok=1 msg p4 p6 lst
   tag="$(cat "$STATE_TAG" 2>/dev/null || true)"
   IFS=$'\t' read -r ref rdate < <(gh_commit_of "$NTM_REPO_PATH") || true
@@ -948,11 +993,18 @@ maybe_run_ntm() {
     return 0
   fi
 
+  local noif; noif="$(ntm_missing_ifaces)"
+  if [[ -n "$noif" ]]; then
+    log "[ntm] Nym's NTM needs nymtun0 and nymwg; this $mode has no$noif. NOT applying"
+    [[ "$mode$noif" != "$(cat "$NTM_IFACE_STATE" 2>/dev/null || true)" ]] || return 0   # reported already
+    printf '%s\n' "$mode$noif" > "$NTM_IFACE_STATE"
+    notify failed "NTM not run here: Nym's NTM needs nymtun0 and nymwg, this $mode has no$noif"; return 0
+  fi
+  rm -f "$NTM_IFACE_STATE"
   # we only touch the firewall if it can be snapshotted and put back
   if ! command -v iptables-save >/dev/null 2>&1 || [[ -z "$(iptables-save 2>/dev/null | head -c1)" ]]; then
     log "[ntm] the firewall cannot be snapshotted with iptables-save; NOT applying"; notify failed "NTM ${ref:0:12} not applied: no iptables-save snapshot possible here"; return 1
   fi
-  for t in "$iface" nymwg; do ip link show "$t" >/dev/null 2>&1 || { log "[ntm] interface $t is missing; NOT applying"; return 1; }; done
   tmp="$(mktemp -d "$STATE_DIR/ntm.XXXXXX" 2>/dev/null)" || { log "[ntm] mktemp failed"; return 0; }
   if ! gcurl -fsSL --proto '=https' --proto-redir '=https' --retry 5 $RETRY_ALL --retry-delay 5 --max-time 180 \
          -o "$tmp/ntm.sh" "https://raw.githubusercontent.com/$REPO/$ref/$NTM_REPO_PATH" \
@@ -1184,13 +1236,95 @@ fw_decision() {
       if (r ~ / -j (DROP|REJECT) /) { print "DROP"; found = 1; exit } }
     END { if (!found) print (pol == "" ? "DROP" : pol) }'
 }
-# The host firewall lets <proto>/<port> in from anywhere, v4 and v6.
+# The host firewall lets <proto>/<port> in from anywhere, v4 and v6. Where ufw is active its rules
+# decide first; where none of them does and its default drops, INPUT's own rules after ufw's decide.
 fw_port_open() {          # args: proto port
-  local c
+  local c d v4="" v6="" def=""
+  if ufw_active; then read -r v4 v6 def <<<"$(ufw_view "$1" "$2")"; fi
   for c in iptables ip6tables; do
     command -v "$c" >/dev/null 2>&1 || continue
+    d="$v4"; [[ "$c" == ip6tables ]] && d="$v6"
+    if [[ "$d" == R ]]; then d=-; fi
+    case "$d:$def" in
+      A:*|-:allow)  continue ;;
+      D:*|-:reject) log "[bridge] check failed: ufw does not let $1/$2 in ($c)"; return 1 ;;
+    esac
     [[ "$(fw_decision "$c" "$1" "$2")" == ACCEPT ]] || { log "[bridge] check failed: $c does not let $1/$2 in"; return 1; }
   done
+}
+
+ufw_active() { command -v ufw >/dev/null 2>&1 && [[ "$(LC_ALL=C ufw status 2>/dev/null | head -n1)" == "Status: active" ]]; }
+# What ufw decides for a new connection from any internet address to <proto>/<port>, read from
+# `ufw status verbose` (every IPv4 rule in order, then every IPv6 one; app profiles shown as ports).
+# Per family, the first rule that decides: A (ALLOW, LIMIT), D (DENY, REJECT) or - (none); R when none
+# decides but the operator allows the port only for some sources, an interface or an address; x when
+# ufw does not manage IPv6 here. Rules for some sources only do not decide. A rule bound to a local
+# address or an interface, or one not read here, decides only when it closes; a rule line that cannot
+# be read closes (fail closed). stdout: "<v4> <v6> <ufw default incoming: allow|deny|reject>"
+ufw_view() {              # args: proto port
+  local v
+  v="$(LC_ALL=C ufw status verbose 2>/dev/null | awk -v pr="$1" -v p="$2" '
+    function covers(to,   a, n, c, k, i, b) {     # 1 covers, 0 does not, -1 not read
+      n = split(to, a, "/")
+      if (a[1] != "Anywhere" && a[1] !~ /^[0-9]+(:[0-9]+)?(,[0-9]+(:[0-9]+)?)*$/) return -1
+      if (n > 2 || (n == 2 && a[2] != pr)) return 0
+      if (a[1] == "Anywhere") return 1
+      k = split(a[1], c, ",")
+      for (i = 1; i <= k; i++) {
+        if (index(c[i], ":")) { split(c[i], b, ":"); if (p + 0 >= b[1] + 0 && p + 0 <= b[2] + 0) return 1 }
+        else if (c[i] + 0 == p + 0) return 1 }
+      return 0 }
+    function is6(s) { return s ~ /:.*:/ && s !~ /,/ && s !~ /\/[a-z]+$/ }   # an IPv6 address, not a port list
+    /^Status: active/ { st = 1; next }
+    /^Default:/ { def = ($0 ~ /allow \(incoming\)/) ? "allow" : (($0 ~ /reject \(incoming\)/) ? "reject" : "deny"); next }
+    /^--/ { go = 1; next }
+    !go || /^[[:space:]]*$/ { next }
+    !match($0, / (ALLOW|DENY|REJECT|LIMIT)( (IN|OUT|FWD))? /) { if (d4 == "") d4 = "D"; if (d6 == "") d6 = "D"; next }
+    { to = substr($0, 1, RSTART - 1); act = substr($0, RSTART + 1, RLENGTH - 2); from = substr($0, RSTART + RLENGTH) }
+    act ~ / (OUT|FWD)$/ { next }
+    { sub(/^ +/, "", from); sub(/ +$/, "", to)
+      v6 = sub(/ \(v6\)/, "", to); if (from ~ /^Anywhere(\/[a-z0-9]+)? \(v6\)/) v6 = 1
+      split(from, fa, " "); if (is6(fa[1])) v6 = 1                 # ufw marks (v6) only when both ends are ::/0
+      if (match(to, /^[^ ]+ /) && is6(substr(to, 1, RLENGTH - 1))) v6 = 1
+      anyw = (from ~ /^Anywhere(\/[a-z0-9]+)?( \(v6\))?(  |$)/)
+      narrow = sub(/ on [^ ]+$/, "", to); sub(/ \([^()]*\)$/, "", to); if (sub(/^[^ ]+ /, "", to)) narrow = 1
+      allow = (act ~ /^(ALLOW|LIMIT)( IN)?$/); c = covers(to) }
+    !anyw || c == 0 || (allow && (c < 0 || narrow)) { if (allow && c == 1 && to !~ /^Anywhere/) { if (v6) r6 = 1; else r4 = 1 }; next }
+    v6 && d6 == "" { d6 = allow ? "A" : "D" }
+    !v6 && d4 == "" { d4 = allow ? "A" : "D" }
+    END { if (!st) { print "D D deny"; exit }                       # ufw did not answer: fail closed
+          print (d4 != "" ? d4 : (r4 ? "R" : "-")), (d6 != "" ? d6 : (r6 ? "R" : "-")), (def == "" ? "deny" : def) }')"
+  # ufw manages IPv6 exactly when its IPv6 chains exist
+  ip6tables -w -n -L ufw6-user-input >/dev/null 2>&1 || v="${v%% *} x ${v##* }"
+  printf '%s\n' "$v"
+}
+
+# An entry gateway without WireGuard is not NTM's: Nym keeps it on ufw and opens the bridge and Lewes
+# Protocol ports there (Ansible deploy, nym_ufw_rules). Same here, only where ufw is active. A port a
+# ufw rule closes or limits to some sources or an interface is left alone and reported.
+# UFW_PORTS_ENABLED=0 in the config turns it off.
+UFW_ENTRY_PORTS="4443/tcp 4443/udp 4422/tcp 41264/tcp 51264/udp"
+UFW_PORTS_ENABLED="${NYM_UFW_PORTS:-1}"
+UFW_FAILED_STATE="$STATE_DIR/ufw_failed"
+maybe_open_ufw_ports() {
+  [[ "$UFW_PORTS_ENABLED" == 1 && "$(node_mode 2>/dev/null || true)" == entry ]] && ufw_active || return 0
+  local p v4 v6 def added="" miss=""
+  for p in $UFW_ENTRY_PORTS; do
+    read -r v4 v6 def <<<"$(ufw_view "${p#*/}" "${p%/*}")"
+    if [[ "$v4$v6" == *[DR]* ]]; then miss="$miss $p"; continue; fi
+    [[ "$v4" == A && "$v6" =~ ^[Ax]$ ]] && continue
+    # only the family with no rule: a generic `ufw allow` would replace the other family's rule in place
+    [[ "$v4" == - ]] && { ufw allow proto "${p#*/}" from 0.0.0.0/0 to any port "${p%/*}" >/dev/null 2>&1 || true; }
+    [[ "$v6" == - ]] && { ufw allow proto "${p#*/}" from ::/0 to any port "${p%/*}" >/dev/null 2>&1 || true; }
+    read -r v4 v6 def <<<"$(ufw_view "${p#*/}" "${p%/*}")"
+    if [[ "$v4" == A && "$v6" =~ ^[Ax]$ ]]; then added="$added $p"; else miss="$miss $p"; fi
+  done
+  if [[ -n "$added" ]]; then log "[ufw] opened$added (Nym's ports for an entry gateway without WireGuard)"; notify success "ufw: opened$added"; fi
+  if [[ -z "$miss" ]]; then rm -f "$UFW_FAILED_STATE"; return 0; fi
+  log "[ufw] not open to everyone:$miss (a ufw rule closes or limits them, or ufw allow failed); left as they are"
+  [[ "$miss" != "$(cat "$UFW_FAILED_STATE" 2>/dev/null || true)" ]] || return 0   # reported already
+  printf '%s\n' "$miss" > "$UFW_FAILED_STATE"; notify failed "ufw: not open to everyone:$miss (a ufw rule closes or limits them). See $LOGFILE"
+  return 1
 }
 
 
@@ -1261,7 +1395,7 @@ doctor_checks() {
 
   # NTM: present at the stable tag and at a newer prerelease, with every subcommand maybe_run_ntm
   # calls (checking the prerelease warns before the updater ever needs that NTM)
-  if [[ -n "$lt" ]] && [[ "$scope" == "all" || "${NTM_ENABLED:-0}" == "1" ]]; then
+  if [[ -n "$lt" ]] && { [[ "$scope" == "all" ]] || { ntm_mode >/dev/null && [[ -z "$(ntm_missing_ifaces)" ]]; }; }; then
     for t in $(gh_commit_of "$NTM_REPO_PATH" | cut -f1); do   # the NTM the notes point to: develop, pinned
       tmp="$(mktemp 2>/dev/null)" || return 1
       if gcurl -fsSL --proto '=https' --retry 2 --max-time 120 -o "$tmp" "https://raw.githubusercontent.com/$REPO/$t/$NTM_REPO_PATH" 2>/dev/null; then
@@ -1370,7 +1504,7 @@ cmd_run() {
   ensure_dirs
   resolve_target
   [[ -n "$UNIT" || -n "${API_UNIT:-}" ]] || die "no nym-node or nym-api systemd service found (run 'install' first)"
-  local node_rc=0 bridge_rc=0 ntm_rc=0 api_rc=0
+  local node_rc=0 bridge_rc=0 ntm_rc=0 ufw_rc=0 api_rc=0
 
   if [[ -n "$UNIT" ]]; then
     sctl cat "$UNIT" >/dev/null 2>&1       || die "configured unit '$UNIT' not known to systemd (${SVC_SCOPE:-system} scope)"
@@ -1388,6 +1522,7 @@ cmd_run() {
     fi
 
     maybe_run_ntm || ntm_rc=$?
+    maybe_open_ufw_ports || ufw_rc=$?
     if [[ -n "${BRIDGE_UNIT:-}" ]] && systemctl cat "$BRIDGE_UNIT" >/dev/null 2>&1; then maybe_configure_bridge || bridge_rc=$?; fi
 
     # run any remaining operator actions the official changelog lists (non-tunnel; deny-list enforced)
@@ -1412,10 +1547,10 @@ cmd_run() {
 
   doctor_watch || true
 
-  log "run complete (nym-node rc=$node_rc, nym-bridge rc=$bridge_rc, ntm rc=$ntm_rc, nym-api rc=$api_rc)"
+  log "run complete (nym-node rc=$node_rc, nym-bridge rc=$bridge_rc, ntm rc=$ntm_rc, ufw rc=$ufw_rc, nym-api rc=$api_rc)"
   # read by cmd_poll for the bot: the box's main component (nym-node, or nym-api on an api-only box)
   printf '%s\n' "$( [[ -n "$UNIT" ]] && echo "$node_rc" || echo "$api_rc" )" > "$STATE_DIR/last_node_rc" 2>/dev/null || true
-  if (( node_rc != 0 || bridge_rc != 0 || ntm_rc != 0 || api_rc != 0 )); then exit 1; fi
+  if (( node_rc != 0 || bridge_rc != 0 || ntm_rc != 0 || ufw_rc != 0 || api_rc != 0 )); then exit 1; fi
   exit 0
 }
 
@@ -1442,6 +1577,27 @@ cmd_install() {
   if [[ -n "$brunit" ]]; then brbin="$(detect_bridge_bin "$brunit")"; brver="$(dpkg-query -W -f='${Version}' nym-bridge 2>/dev/null || true)"; fi
   local ntm_en ntm_path ntm_iface
   IFS=$'\t' read -r ntm_en ntm_path ntm_iface < <(detect_ntm) || true
+  # What the operator set survives a re-install. The old config is read the way `run` reads it (sourced,
+  # the last assignment wins) and only if `run` would trust it; every value is checked before it goes
+  # into the new config. An env var given now wins.
+  local o_ntm="" o_ufw="" o_pol="" o_http="" o_tgt="" o_tgc="" re_http='^https?://[][A-Za-z0-9.:_-]+$'
+  if [[ -f "$CONFIG_FILE" && "$(stat -c '%U' "$CONFIG_FILE" 2>/dev/null || echo '?')" == root \
+        && -z "$(find "$CONFIG_FILE" -perm /022 2>/dev/null)" ]]; then
+    IFS=$'\x1f' read -r o_ntm o_ufw o_pol o_http o_tgt o_tgc < <(
+      unset NTM_ENABLED UFW_PORTS_ENABLED NTM_INPUT_POLICY NODE_HTTP TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID
+      set +eu; source "$CONFIG_FILE" >/dev/null 2>&1
+      printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "${NTM_ENABLED-}" "${UFW_PORTS_ENABLED-}" "${NTM_INPUT_POLICY-}" \
+        "${NODE_HTTP-}" "${TELEGRAM_BOT_TOKEN-}" "${TELEGRAM_CHAT_ID-}") || true
+  elif [[ -f "$CONFIG_FILE" ]]; then
+    log "WARNING: $CONFIG_FILE is not root-owned or is writable by others; its settings are not carried over"
+  fi
+  if [[ -n "$o_ntm" && "$o_ntm" != 1 ]]; then ntm_en=0; fi      # anything but 1 was off
+  [[ -n "${NYM_UFW_PORTS:-}" || -z "$o_ufw" ]] || UFW_PORTS_ENABLED="$o_ufw"
+  [[ -n "${NYM_NTM_INPUT_POLICY:-}" || -z "$o_pol" ]] || NTM_INPUT_POLICY="$o_pol"
+  [[ -n "${NYM_NODE_HTTP:-}" || -z "$o_http" ]] || NODE_HTTP="$o_http"
+  if [[ "$UFW_PORTS_ENABLED" == 1 ]]; then UFW_PORTS_ENABLED=1; else UFW_PORTS_ENABLED=0; fi
+  NTM_INPUT_POLICY="${NTM_INPUT_POLICY^^}"; [[ "$NTM_INPUT_POLICY" =~ ^(DROP|KEEP)$ ]] || NTM_INPUT_POLICY=DROP
+  [[ "$NODE_HTTP" =~ $re_http ]] || NODE_HTTP="http://127.0.0.1:8080"
   local apiunit apibin apiurl apiver apiage
   apiunit="${NYM_API_UNIT:-$(detect_api_unit)}"; apibin=""; apiurl=""; apiver=""
   apiage="${NYM_API_MIN_AGE_HOURS:-$MIN_AGE_HOURS}"; [[ "$apiage" =~ ^[0-9]+$ ]] || apiage="$MIN_AGE_HOURS"
@@ -1462,10 +1618,17 @@ cmd_install() {
   else
     echo "  QUIC bridge   : none (mixnode / no bridge)   -> bridge updates skipped"
   fi
-  if [[ "$ntm_en" == "1" ]]; then
-    echo "  tunnel (NTM)  : exit gateway (iface ${ntm_iface}) -> checked per release; runs nymtech NTM as root (no upstream checksum)"
+  local nmode; nmode="$(node_mode 2>/dev/null || echo "unknown (node API at $NODE_HTTP not answering)")"
+  echo "  node mode     : ${nmode}"
+  if [[ "$ntm_en" == 1 ]]; then
+    echo "  tunnel (NTM)  : on exit and WireGuard entry gateways only (Nym's rule), checked every run; runs nymtech NTM as root (no upstream checksum)"
   else
-    echo "  tunnel (NTM)  : not an exit gateway -> NTM step skipped"
+    echo "  tunnel (NTM)  : off (NTM_ENABLED=0)"
+  fi
+  if [[ "$nmode" == entry && "$UFW_PORTS_ENABLED" == 1 ]]; then
+    echo "  ufw           : if active, Nym's bridge and Lewes ports are opened ($UFW_ENTRY_PORTS)"
+  elif [[ "$nmode" == entry ]]; then
+    echo "  ufw           : left alone (UFW_PORTS_ENABLED=0)"
   fi
   if [[ -n "$apiunit" ]]; then
     echo "  nym-api       : ${apiunit}  bin=${apibin:-<?>}  ver=${apiver:-<?>}  url=${apiurl:-<?>}  -> auto-updated (SHA-256, HTTP + signer check, soak ${apiage}h)"
@@ -1488,7 +1651,8 @@ cmd_install() {
         read -rp "  nym-api bin     [${apibin}]: " a; apibin="${a:-$apibin}"
         read -rp "  nym-api url     [${apiurl}]: " a; apiurl="${a:-$apiurl}"
       else apibin=""; apiurl=""; fi
-      read -rp "  enable NTM tunnel checks? (1/0) [${ntm_en}]: " a; ntm_en="${a:-$ntm_en}"
+      read -rp "  NTM step (1 = by node mode, 0 = off) [${ntm_en}]: " a; ntm_en="${a:-$ntm_en}"
+      if [[ "$ntm_en" != 1 ]]; then ntm_en=0; fi
       if [[ "$ntm_en" == "1" ]]; then
         read -rp "  NTM script path [${ntm_path}]: " a;  ntm_path="${a:-$ntm_path}"
         read -rp "  tunnel iface    [${ntm_iface}]: " a; ntm_iface="${a:-$ntm_iface}"
@@ -1516,12 +1680,10 @@ cmd_install() {
   [[ "${ntm_iface:-nymtun0}" =~ ^[a-zA-Z0-9._-]+$ ]] || ntm_iface="nymtun0"
 
   local sshport="${NYM_SSH_PORT:-$(detect_ssh_port)}"; [[ "$sshport" =~ ^[0-9]+$ ]] || sshport=22
-  # Telegram alerts: prefer env, else preserve whatever is already saved (so re-install keeps them).
-  local tg_token="${NYM_TELEGRAM_BOT_TOKEN:-}" tg_chat="${NYM_TELEGRAM_CHAT_ID:-}"
-  if [[ -f "$CONFIG_FILE" ]]; then
-    [[ -n "$tg_token" ]] || tg_token="$(sed -n 's/^TELEGRAM_BOT_TOKEN="\(.*\)"$/\1/p' "$CONFIG_FILE" | head -n1)"
-    [[ -n "$tg_chat"  ]] || tg_chat="$(sed -n 's/^TELEGRAM_CHAT_ID="\(.*\)"$/\1/p'  "$CONFIG_FILE" | head -n1)"
-  fi
+  # Telegram alerts: prefer env, else keep what the old config had (read above, so re-install keeps them)
+  local tg_token="${NYM_TELEGRAM_BOT_TOKEN:-$o_tgt}" tg_chat="${NYM_TELEGRAM_CHAT_ID:-$o_tgc}"
+  [[ -z "$tg_token" || "$tg_token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || { log "WARNING: the Telegram bot token does not look right; not saved"; tg_token=""; }
+  [[ -z "$tg_chat" || "$tg_chat" =~ ^(-?[0-9]+|@[A-Za-z0-9_]+)$ ]] || { log "WARNING: the Telegram chat id does not look right; not saved"; tg_chat=""; }
   save_config "$unit" "$bin" "${svcuser:-root}" "$role" "$brunit" "$brbin" "${ntm_en:-0}" "$ntm_path" "${ntm_iface:-nymtun0}" "$svcscope" "$sshport" "$tg_token" "$tg_chat" "$apiunit" "$apibin" "$apiurl" "$apiage"
   local tg_state=off; [[ -n "$tg_token" && -n "$tg_chat" ]] && tg_state=on
   log "saved config -> $CONFIG_FILE (unit=${unit:-none} bin=${bin:-none} user=${svcuser:-root} scope=${svcscope} bridge=${brunit:-none} ntm=${ntm_en:-0} api=${apiunit:-none} ssh_port=${sshport} telegram=${tg_state})"
@@ -1686,7 +1848,7 @@ cmd_check() {             # read-only: report whether newer releases exist (no c
     else                              echo "nym-api    : UPDATE AVAILABLE -> $alt   (installed ${aver:-?}, last applied $ainst)"; fi
   fi
 
-  if [[ "${NTM_ENABLED:-0}" == "1" && -n "$lt" ]]; then
+  if [[ -n "$lt" ]] && ntm_mode >/dev/null && [[ -z "$(ntm_missing_ifaces)" ]]; then
     local ntm_inst
     ntm_inst="$(cat "$NTM_STATE" 2>/dev/null || echo '<none>')"
     if   [[ "$lt" == "$ntm_inst" ]]; then echo "tunnel(NTM): already evaluated for $lt"
@@ -1720,11 +1882,22 @@ cmd_status() {
   else
     echo "bridge        : none (updates skipped)"
   fi
-  if [[ "${NTM_ENABLED:-0}" == "1" ]]; then
-    echo "tunnel (NTM)  : enabled  iface=${NTM_IFACE:-nymtun0}  script=${NTM_PATH:-<?>}"
-    echo "ntm last_tag  : $(cat "$NTM_STATE" 2>/dev/null || echo '<none>')"
+  local nmode=none
+  [[ -z "${UNIT:-}" ]] || nmode="$(node_mode 2>/dev/null || echo unknown)"
+  echo "node mode     : ${nmode}"
+  if [[ "$nmode" == none ]]; then
+    echo "tunnel (NTM)  : none (no nym-node on this box)"
+  elif [[ "${NTM_ENABLED:-0}" != 1 ]]; then
+    echo "tunnel (NTM)  : off (NTM_ENABLED=0 in the config)"
+  elif [[ "$nmode" == unknown ]]; then
+    echo "tunnel (NTM)  : unknown: the nym-node API at $NODE_HTTP did not answer (NTM waits for it)"
+  elif [[ "$nmode" != exit && "$nmode" != entry-wg ]]; then
+    echo "tunnel (NTM)  : not on this node (Nym runs NTM on exit and WireGuard entry gateways only)"
+  elif [[ -n "$(ntm_missing_ifaces)" ]]; then
+    echo "tunnel (NTM)  : not run: Nym's NTM needs nymtun0 and nymwg, missing:$(ntm_missing_ifaces)"
   else
-    echo "tunnel (NTM)  : disabled (no $NTM_IFACE interface / not an exit gateway)"
+    echo "tunnel (NTM)  : on  script=${NTM_PATH:-<?>}  applied=$(cut -c1-12 "$NTM_REF_STATE" 2>/dev/null || echo '<none>')"
+    echo "ntm last_tag  : $(cat "$NTM_STATE" 2>/dev/null || echo '<none>')"
   fi
   if [[ -n "${API_UNIT:-}" ]]; then
     echo "nym-api unit  : ${API_UNIT}  bin=${API_BIN:-<?>}  ver=$(bin_version "${API_BIN:-/bin/false}")  active=$(systemctl is-active "$API_UNIT" 2>/dev/null || true)"
