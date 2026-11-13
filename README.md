@@ -25,70 +25,42 @@ demand. See [Nymi (Telegram alerts)](#nymi-telegram-alerts) below. **The node ne
   the same backup/rollback machinery as `nym-node`. After the swap the bridge must listen on every port
   its config names (`nym-bridge --print-ports`, 0.3+), and a process of the unit must run the installed
   file, or it is rolled back. A mixnode has no bridge, so this step is skipped.
-- **Bridge TLS/SSH configuration** (since 1.9.0) - **gateways with a bridge 0.3.0 or newer**. The operator
-  notes ask operators to re-run the bridge setup (`quic_bridge_deployment.sh`). The updater does the same
-  without running that script or dpkg:
-  - The transports to add come from the setup script's `NEW_TRANSPORTS` on `nymtech/nym` develop,
-    pinned to its commit: today tls_plain tcp/4443 and ssh_plain tcp/4422.
-  - `bridge-cfg` is the standalone asset of the installed bridge release, checked against the sha256
-    the GitHub API publishes for it.
-  - `bridge-cfg --gen` runs in a private mount namespace on **copies** of `/etc/nym` and the nym-node
-    config, so its in-place writes only ever touch copies.
-  - The copies are checked before anything changes on the host:
-    - every existing key, the QUIC key above all, is unchanged;
-    - `forward.address`, `public_ips` and `client_params_path` are unchanged;
-    - the bridge parses the new config and lists the old ports plus the new ones;
-    - `transports` (read by older apps) is still exactly the QUIC entry, and `transports_v2` holds it
-      plus TLS and SSH;
-    - only the expected files differ.
-
-    The nym-node config is never installed: its `bridge_client_params` must already point at the
-    client params.
-  - The change itself:
-    1. `/etc/nym` is snapshotted and a dead-man timer is armed.
-    2. The keys and `bridges.toml` are installed by rename. Private keys get the owner of the QUIC key
-       and are never readable by others.
-    3. A drop-in `Restart=always` is added to the bridge unit. nym-bridge 0.3 stops every listener,
-       QUIC too, and exits 0 when one fails, which `Restart=on-failure` would not restart.
-    4. The bridge restarts. It must run stable, listen on every port, and serve the published keys on
-       TLS and SSH, and the host firewall must let the new ports in.
-    5. Only then are the new transports published (the client params file nym-node serves).
-  - Any failed check restores `/etc/nym` exactly (paths, modes, owners, contents) and the unit, and
-    QUIC must be back. `bridge-plan` shows what it would change without changing anything.
-  - It runs again only when the bridge release or the setup script's commit changes. Set
-    `NYM_BRIDGE_CFG=0` to keep it off.
-- **Network Tunnel Manager (NTM)** - **exit gateways only**. This is `network-tunnel-manager.sh`
-  (a script, not a binary) that sets up the gateway's iptables, forwarding, host firewall and exit
-  policy. The operator notes tell operators to take it from `nymtech/nym` **develop** and run
-  `complete_networking_configuration`; since 1.9.0 the updater does exactly that, pinned to the
-  newest develop commit that touched the script.
-  - **When it runs:**
-    - the script got a new commit upstream and that commit is 2h old (NIP exit-policy votes arrive this
-      way, often before any notes);
-    - or the current release's operator notes give an explicit NTM instruction (the NTM command in a
-      shell block, or "re-run NTM"). The notes are read again whenever the notes file gets a new commit.
-  - **How it is applied:**
-    - preflight;
-    - a full snapshot (iptables v4/v6 with every table NTM may touch, the rule files, the net sysctls,
-      ufw's config and state);
-    - a dead-man timer that restores the snapshot if the run dies (no timer, no apply);
-    - then the run.
-  - **The checks:**
-    - NTM's own `check_firewall_setup`;
-    - the exit chain closed and holding every tcp/udp port of the applied NTM's allowlist, v4 and v6;
-    - every port that was reachable before (SSH and every listening service) no less reachable after,
-      judged by walking the INPUT rules in order;
-    - a real egress probe through the tunnel;
-    - nym-node up;
-    - the rules saved for reboot.
-  - **On failure:** the snapshot is restored, and the same NTM is retried after 6h, 12h, 24h. An
-    unsettled apply is restored by the next run before anything else changes.
-  - **The host firewall:** NTM's host firewall drops inbound traffic it does not list (its default
-    `HOST_INPUT_POLICY=DROP`). Where the INPUT policy was ACCEPT, every service already listening on
-    the host gets an ACCEPT at the end of INPUT, so its reachability stays exactly as it was. Set
-    `NTM_INPUT_POLICY=KEEP` in the config to leave the INPUT policy alone.
-  - The NTM script ships no upstream checksum (see the Trust model section). Detected via the
-    `nymtun0` interface.
+- **Operator notes -> actions** - before acting, the updater reads the current release's section of the
+  operator changelog (`documentation/docs/content/operators/changelog.mdx`). The instructions in it are
+  in practice of two kinds: run the network tunnel manager, and run the bridge setup. The updater does
+  both, by role, with Nym's own scripts, as an operator would by hand. Anything else the notes list
+  (config edits, placeholders like `<PORT>`, ansible variants) is never executed: it is sent to you as
+  manual steps.
+- **Network Tunnel Manager (NTM)** - **exit gateways only** (detected via `nymtun0`). The notes say:
+  take `network-tunnel-manager.sh` from `nymtech/nym` develop and run `complete_networking_configuration`.
+  - **When it runs:** when that script gets a new commit upstream (2h old; NIP exit-policy votes arrive
+    this way), or when the current release's notes ask for a re-run.
+  - **How:** pinned to the commit, with the firewall snapshotted first.
+  - **Checks after the run:**
+    - the tunnel egresses and nym-node is up;
+    - the SSH port is let in;
+    - the exit policy holds every port of the script's list (tcp and udp, v4 and v6);
+    - the rules are saved for reboot.
+  - **On failure:** the snapshot is restored, and that NTM commit is not retried until a newer one (or
+    "Update now" in Nymi).
+  - **Host firewall:** NTM drops inbound traffic it does not list. Where the INPUT policy was ACCEPT,
+    services already listening on the host get an ACCEPT at the end of INPUT, so they stay reachable as
+    before. `NTM_INPUT_POLICY=KEEP` in the config leaves the policy alone.
+- **Bridge TLS/SSH** - **gateways with a bridge 0.3.0 or newer**. The notes ask to re-run the bridge
+  setup.
+  - **How:** the updater runs Nym's `quic_bridge_deployment.sh` from develop (pinned to its commit)
+    non-interactively, for the installed bridge release. That script installs the bridge package and
+    adds the TLS (tcp/4443) and SSH (tcp/4422) transports.
+  - **Backup first:** `/etc/nym` and the nym-node config.
+  - **Checks after the run:**
+    - the bridge is up on every port;
+    - the QUIC key is unchanged;
+    - TLS and SSH are published, and `transports` (read by older apps) is still QUIC only.
+  - **On failure:** both are put back and the bridge restarted.
+  - **After success:** a drop-in `Restart=always` is added. nym-bridge 0.3 stops QUIC too, exiting 0,
+    when TLS or SSH fails.
+  - It runs again only when the bridge release or the setup script changes. `NYM_BRIDGE_CFG=0` keeps it
+    off.
 
 - **`nym-api`** (validator API / ecash signer) - **only if `nym-api.service` exists**, with or without
   a nym-node on the same box. Same source, SHA-256 check, soak delay and hourly run as `nym-node`
@@ -256,7 +228,6 @@ carries the node's IP, its secret (in a header) and the updater version, nothing
 | `NYM_API_MIN_AGE_HOURS` | same as `NYM_MIN_AGE_HOURS` | Soak delay for nym-api releases, written to the config at install (`API_MIN_AGE_HOURS`). |
 | `NYM_API_UNIT` / `NYM_API_BIN` / `NYM_API_URL` | detected | Override the nym-api unit, binary, or the local URL it answers on (from `bind_address`). |
 | `NYM_NTM_INPUT_POLICY` | `DROP` | NTM's `HOST_INPUT_POLICY`: `DROP` (its default) or `KEEP` (no inbound drop). `NTM_INPUT_POLICY=` in the config. |
-| `NYM_NTM_KEEP_LISTENERS` | `1` | `1` = under DROP, services already listening keep an ACCEPT at the end of INPUT (only where the policy was ACCEPT). `NTM_KEEP_LISTENERS=` in the config. |
 | `NYM_NTM_BRANCH`     | `develop` | Branch the NTM and the bridge setup script are followed on (pinned to a commit each run). |
 | `NYM_NTM_MIN_AGE_HOURS` | `2` | A new NTM commit is applied once it is this old. |
 | `NYM_NTM_TIMEOUT`    | `900`   | Seconds for one NTM run. |
@@ -267,9 +238,9 @@ carries the node's IP, its secret (in a header) and the updater version, nothing
 - Config: `/etc/nym-node-autoupdate.conf` (`UNIT`, `BIN`, `SVC_USER`, `API_UNIT`, `API_BIN`, `API_URL`,
   `API_MIN_AGE_HOURS`) - edit by hand any time.
 - State: `/var/lib/nym-autoupdate/` (`last_tag`, `failed_tags`, `api_last_tag`, `api_failed_tags`, `backups/`).
-  NTM: `ntm_applied_ref`, `ntm_applied_sha256`, `ntm_notes_tag`, `ntm_failed_ref`, the last snapshot in
-  `ntm-snapshot/`. Bridge configuration: `bridge_cfg_applied`, `bridge_cfg_failed`, `bridge-snapshot/`.
-  A snapshot without a `done` file is an unsettled change; the next run restores it first.
+  NTM: `ntm_applied_ref` (the commit applied), `ntm_failed_ref` (a commit that failed and was rolled
+  back; delete it to retry), `ntm_last_tag` (release whose notes were acted on). Bridge:
+  `bridge_cfg_applied`, `bridge_cfg_failed` ("<bridge release> <setup script commit>").
 - Logs: `/var/log/nym-autoupdate.log` and the system journal (`journalctl -t nym-autoupdate`).
 - To retry a release that previously failed health check here: remove its line from
   `/var/lib/nym-autoupdate/failed_tags`.
@@ -297,10 +268,10 @@ sudo apt-get install -y curl jq coreutils util-linux
 
 The script **hard-fails loudly** (the systemd unit goes red) if a required command is missing, so a
 missing dependency can never turn it into a silent no-op. Exit gateways additionally use
-`iptables-save`/`iptables-restore`, `systemd-run` and (ideally) `netfilter-persistent` for the tunnel
-step; if those are absent it **skips** the tunnel step rather than touching the firewall with no
-revert path. The bridge step additionally needs `unshare`, `mount`, `openssl` and `ssh-keyscan`, and a
-system (not user) service; otherwise it is skipped with an alert.
+`iptables-save`/`iptables-restore` and (ideally) `netfilter-persistent` for the tunnel step; if those
+are absent it **skips** the tunnel step rather than touching the firewall with no revert path. The
+bridge step runs Nym's setup script, which needs `dpkg`, `openssl` and glibc 2.34+ (amd64), and a
+system (not user) service.
 
 Run `run`/`install` as root (it replaces the binary and manages systemd; it will `sudo` itself if
 needed). `check`/`status` are read-only and need no root.
@@ -317,6 +288,7 @@ needed). `check`/`status` are read-only and need no root.
   There is no upstream checksum or signature, so this trusts the integrity of the nym GitHub org and
   its develop branch, the same as running their documented tunnel setup by hand. Set
   `NTM_ENABLED=0` (or answer the install prompt) to opt out entirely.
-- **bridge-cfg** (gateways with a bridge) is the release asset checked against the sha256 the GitHub
-  API publishes for it; it runs as root on copies only. The bridge setup script is never run; only its
-  list of transports is read. `NYM_BRIDGE_CFG=0` opts out.
+- **Bridge setup** (gateways with a bridge 0.3+): Nym's `quic_bridge_deployment.sh` from develop,
+  pinned to its commit, **run as root**. It installs the bridge release .deb (no upstream checksum)
+  and edits `/etc/nym` and the nym-node config, exactly as when run by hand. `NYM_BRIDGE_CFG=0`
+  opts out.

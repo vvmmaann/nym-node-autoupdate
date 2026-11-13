@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.9.1 - 2026-11-13
+
+Simpler: the updater now does what the operator notes say with Nym's own scripts, as an operator
+would by hand, instead of its own machinery. Same goal as 1.9.0, about a fifth of the code.
+
+- **NTM (exit gateways).**
+  - `network-tunnel-manager.sh` comes from develop, pinned to its commit, and runs
+    `complete_networking_configuration`.
+  - It runs when the script gets a new commit upstream (2h old) or when the current release's notes
+    ask for a re-run.
+  - The firewall is snapshotted first. After the run: tunnel egress, nym-node up, SSH let in, every
+    port of the script's exit list present (tcp and udp, v4 and v6), rules saved. Otherwise the
+    snapshot is restored.
+  - Services already listening stay reachable under NTM's inbound drop.
+- **Bridge TLS/SSH (gateways with a 0.3+ bridge).**
+  - `quic_bridge_deployment.sh` from develop, pinned, runs non-interactively for the installed bridge
+    release, after a backup of `/etc/nym` and the nym-node config.
+  - After the run: bridge up on every port, QUIC key unchanged, TLS and SSH published, and `transports`
+    still QUIC only. Otherwise the backup is restored.
+  - After success a drop-in `Restart=always` is added.
+- **Removed from 1.9.0:** the own bridge installer (`bridge-plan`), the dead-man timers and recovery
+  runs, the INPUT rule evaluator, the retry schedule. A failed NTM or bridge change is not retried
+  until upstream changes or "Update now" in Nymi.
+- **Kept:** no binary swap if the service did not stop, and after an update a process of the unit
+  must run the installed file.
+- **Known limits:**
+  - A run that dies in the middle of NTM or the bridge script leaves whatever that script left,
+    exactly as when run by hand; there is no automatic restore.
+  - The bridge script installs the bridge .deb (no upstream checksum) with its side effects.
+- **Tested** on an exit gateway that 1.9.0 had not set up (Ubuntu 22.04, 13.11):
+  - NTM applied: 8000 tcp/udp in the exit policy for v4 and v6, INPUT DROP, every service reachable
+    from outside;
+  - the bridge script configured TLS and SSH, serving the published keys from outside, with the QUIC
+    key unchanged;
+  - a second run changed nothing.
+
+  A host already set up by 1.9.0 (the same state files) has nothing new to do.
+- **Not tested:** the failure paths (restore after a failed check), and a real NymVPN client over
+  TLS/SSH.
+
 ## 1.9.0 - 2026-11-13
 
 The updater now applies what the operator notes ask for on exit gateways: the network setup from the
