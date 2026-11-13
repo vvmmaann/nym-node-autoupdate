@@ -1,5 +1,68 @@
 # Changelog
 
+## 1.9.0 - 2026-11-13
+
+The updater now applies what the operator notes ask for on exit gateways: the network setup from the
+current NTM, and the bridge TLS/SSH transports. Until 1.8.0 it ran an older NTM from the release tag,
+and only five of its subcommands, never the exit policy. So the v2026.22-istanbul notes (NIP-15:
+tcp+udp 8000 in the exit policy; re-run the bridge setup) were not applied.
+
+**Exit gateways: NTM**
+- NTM comes from `nymtech/nym` develop, as the notes say, pinned to the newest commit that touched it.
+  It runs as `complete_networking_configuration`.
+- **When it runs:** the script got a new commit upstream and that commit is 2h old; or the current
+  release's notes give an explicit NTM instruction. The notes are re-read whenever the notes file gets
+  a new commit.
+- **Before the run:**
+  - a full snapshot: iptables with every table NTM may touch, the rule files, the net sysctls, ufw;
+  - a dead-man timer that restores the snapshot if the run dies. No timer, no apply.
+- **Checks after the run:**
+  - NTM's `check_firewall_setup`;
+  - the exit chain closed, with every port of the applied NTM's allowlist for tcp and udp, v4 and v6;
+  - SSH and every listening service no less reachable than before, judged by walking the INPUT rules
+    in order;
+  - tunnel egress, nym-node up, the rules saved for reboot.
+- **On failure:** the snapshot is restored, and the same NTM is retried after 6h, 12h, 24h. A change
+  that never settled is restored by the next run before anything else.
+- **Behaviour change.** NTM's host firewall now drops inbound traffic it does not list
+  (`HOST_INPUT_POLICY=DROP`, its default). Where the INPUT policy was ACCEPT, every service already
+  listening keeps an ACCEPT at the end of INPUT, so it stays reachable exactly as before.
+  `NTM_INPUT_POLICY=KEEP` in the config leaves the policy alone.
+
+**Gateways: bridge TLS/SSH**
+- **Like the bridge setup script, without running it or dpkg:**
+  - tls_plain tcp/4443 and ssh_plain tcp/4422 are added, the transports the script names on develop;
+  - `bridge-cfg` is the bridge release's own asset, checked against the sha256 GitHub publishes;
+  - it runs on copies of `/etc/nym` in a private mount namespace.
+- **Before anything changes, the copies must show:** the QUIC key and QUIC entry unchanged, `forward`
+  and the public IPs unchanged, and older apps still seeing only QUIC in `transports`.
+- **Then:**
+  1. a drop-in `Restart=always` (nym-bridge 0.3 stops QUIC too when TLS or SSH fails);
+  2. a bridge restart;
+  3. TLS and SSH must serve the published keys, and the host firewall must let their ports in;
+  4. only then are the new transports published.
+- Any failure restores `/etc/nym` and the unit exactly. `bridge-plan` shows the change without making it.
+
+**Also**
+- A process of the unit must run the installed binary after an update, and a rollback needs the
+  service to stop first.
+- `doctor` checks the develop NTM and the bridge setup script.
+- The NTM and bridge setup lines are no longer listed as manual commands.
+
+**Tested and not tested**
+- **Tested** on one exit gateway (Debian 12, 13.11):
+  - nym-node 1.43.0 -> 1.44.0;
+  - NTM applied: 8000 tcp/udp in the exit policy for v4 and v6, INPUT DROP, SSH and every service
+    reachable from outside;
+  - the bridge configured: TLS and SSH serving the published keys from outside, QUIC unchanged;
+  - a second run changed nothing.
+- **Not run on a real host:** the failure paths (restore, dead-man timer, recovery on the next run,
+  retries), and hosts with ufw active or a packaged bridge unit (`User=nym`).
+- **Not tested:** a real NymVPN client connecting through the new TLS and SSH transports.
+
+Update with `sudo /usr/local/sbin/nym-node-autoupdate.sh self-update`. On an exit gateway the next
+hourly run then applies NTM and, with a 0.3+ bridge, the TLS/SSH transports.
+
 ## 1.8.0 - 2026-11-12
 
 - **The Nymi check-in sends the updater version** (an `X-Updater-Version` header), so the bot can tell
