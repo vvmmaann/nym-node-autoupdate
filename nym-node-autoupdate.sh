@@ -124,7 +124,7 @@ NYMI_HUB_BASE="${NYM_NYMI_HUB:-https://nymcheckby.unclelem.uk/nymi}"
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
-SCRIPT_VERSION="1.9.1"
+SCRIPT_VERSION="1.9.2"
 SELF_UPDATE_URL="${NYM_SELF_UPDATE_URL:-https://raw.githubusercontent.com/vvmmaann/nym-node-autoupdate/main/nym-node-autoupdate.sh}"
 
 # --------------------------------- logging ----------------------------------
@@ -738,13 +738,18 @@ update_component() {
 
     # rollback: restore the previous binary (atomically), record the failure, verify just as strictly
     log "[$NAME] HEALTH CHECK FAILED for $tag; ROLLING BACK to previous binary"
-    stop_unit "$CUNIT" "$srole" || log "[$NAME] WARN: $CUNIT did not stop before the rollback"
+    record_fail "$CFAILED" "$tag"
+    if ! stop_unit "$CUNIT" "$srole"; then
+      # putting the old file back under a process that keeps running would make disk and process differ
+      log "[$NAME] CRITICAL: $CUNIT did not stop, so the rollback was NOT done; still on $tag. MANUAL INTERVENTION NEEDED."
+      notify failed "CRITICAL: $NAME $tag failed its health check and $CUNIT did not stop for the rollback; check by hand"
+      rc=2; break
+    fi
     if cp -a "$backup" "$dir/.nau-rb.$$" 2>/dev/null && mv -f "$dir/.nau-rb.$$" "$CBIN" 2>/dev/null; then :; else
       log "[$NAME] CRITICAL: rollback restore failed ($backup -> $CBIN)"; rm -f "$dir/.nau-rb.$$" 2>/dev/null || true
     fi
     sctl start "$CUNIT" || true
-    record_fail "$CFAILED" "$tag"
-    if is_healthy "$CUNIT" "$CBIN" "$curver"; then
+    if is_healthy "$CUNIT" "$CBIN" "$curver" && unit_runs_current_binary "$CUNIT" "$CBIN"; then
       log "[$NAME] ROLLBACK OK: restored ${curver:-previous} binary, $CUNIT healthy again. $tag failure recorded."
       notify rollback "$NAME update to $tag FAILED; rolled back to ${curver:-previous}, $CUNIT is UP"; rc=1; break
     fi
@@ -893,11 +898,8 @@ ntm_keep_listeners() {    # stdin: host_listeners lines
     fi
   done
 }
-ssh_allowed() {           # arg: iptables|ip6tables ; the SSH port is let in (policy ACCEPT, NTM's rule, or ours)
-  local c="$1" p="${SSH_PORT:-22}"
-  [[ "$("$c" -w -S INPUT 2>/dev/null | awk 'NR==1 {print $3}')" == ACCEPT ]] && return 0
-  "$c" -w -C INPUT -p tcp --dport "$p" -m conntrack --ctstate NEW -m comment --comment NYM-NETWORK-FW -j ACCEPT 2>/dev/null && return 0
-  "$c" -w -C INPUT -p tcp --dport "$p" -m comment --comment "$NTM_KEEP_TAG" -j ACCEPT 2>/dev/null
+ssh_allowed() {           # arg: iptables|ip6tables ; INPUT lets a new SSH connection in from anywhere
+  [[ "$(fw_decision "$1" tcp "${SSH_PORT:-22}")" == ACCEPT ]]
 }
 
 # Keep the gateway in step with the NTM the operator notes point to (network-tunnel-manager.sh on
@@ -908,7 +910,7 @@ ssh_allowed() {           # arg: iptables|ip6tables ; the SSH port is let in (po
 maybe_run_ntm() {
   [[ "${NTM_ENABLED:-0}" == "1" ]] || return 0
   local iface="${NTM_IFACE:-nymtun0}" dest="${NTM_PATH:-/usr/local/sbin/network-tunnel-manager.sh}"
-  local tag ref="" rdate="" applied failed why="" matched crc age tmp t ok=1 msg p4 p6 lst
+  local tag ref="" rdate="" applied failed why="" matched crc age tmp t f ok=1 msg p4 p6 lst
   tag="$(cat "$STATE_TAG" 2>/dev/null || true)"
   IFS=$'\t' read -r ref rdate < <(gh_commit_of "$NTM_REPO_PATH") || true
   [[ -n "$ref" ]] || { log "[ntm] could not resolve NTM on $REPO@$NTM_BRANCH; will retry next run"; return 0; }
@@ -959,13 +961,17 @@ maybe_run_ntm() {
   fi
   log "[ntm] applying NTM @ $ref ($why); sha256 $(sha256sum "$tmp/ntm.sh" | cut -c1-16)"
 
-  # snapshot: live rules (with empty sections for tables NTM may create) and the files it rewrites
-  iptables-save > "$tmp/v4" 2>/dev/null; ip6tables-save > "$tmp/v6" 2>/dev/null || true
+  # snapshot: live rules (with empty sections for tables NTM may create) and the files it rewrites.
+  # Without a complete snapshot nothing is applied.
+  t=1
+  iptables-save > "$tmp/v4" 2>/dev/null && [[ -s "$tmp/v4" ]] || t=0
+  if command -v ip6tables-save >/dev/null 2>&1; then ip6tables-save > "$tmp/v6" 2>/dev/null && [[ -s "$tmp/v6" ]] || t=0; fi
+  for f in rules.v4 rules.v6; do if [[ -e "/etc/iptables/$f" ]]; then cp -a "/etc/iptables/$f" "$tmp/file.$f" || t=0; fi; done
+  if (( t == 0 )); then log "[ntm] could not take a complete firewall snapshot; NOT applying"; rm -rf "$tmp"; return 1; fi
   for t in filter nat mangle; do
     grep -q "^\*$t\$" "$tmp/v4" || printf '*%s\nCOMMIT\n' "$t" >> "$tmp/v4"
     [[ ! -s "$tmp/v6" ]] || grep -q "^\*$t\$" "$tmp/v6" || printf '*%s\nCOMMIT\n' "$t" >> "$tmp/v6"
   done
-  for t in rules.v4 rules.v6; do [[ -e "/etc/iptables/$t" ]] && cp -a "/etc/iptables/$t" "$tmp/file.$t"; done
   p4="$(iptables -w -S INPUT 2>/dev/null | awk 'NR==1 {print $3}')"; p6="$(ip6tables -w -S INPUT 2>/dev/null | awk 'NR==1 {print $3}' || true)"
   lst="$(host_listeners)"
   [[ "$NTM_INPUT_POLICY" == DROP ]] && printf '%s\n' "$lst" | ntm_keep_listeners "$p4" "$p6"
@@ -993,10 +999,17 @@ maybe_run_ntm() {
     rm -rf "$tmp"; return 0
   fi
   log "[ntm] restoring the firewall snapshot"
-  iptables-restore < "$tmp/v4" 2>/dev/null || log "[ntm] WARN: iptables-restore failed"
-  [[ -s "$tmp/v6" ]] && { ip6tables-restore < "$tmp/v6" 2>/dev/null || log "[ntm] WARN: ip6tables-restore failed"; }
-  for t in rules.v4 rules.v6; do if [[ -e "$tmp/file.$t" ]]; then cp -a "$tmp/file.$t" "/etc/iptables/$t"; else rm -f "/etc/iptables/$t"; fi; done
+  local rok=1
+  iptables-restore < "$tmp/v4" 2>/dev/null || { log "[ntm] iptables-restore failed"; rok=0; }
+  if [[ -s "$tmp/v6" ]]; then ip6tables-restore < "$tmp/v6" 2>/dev/null || { log "[ntm] ip6tables-restore failed"; rok=0; }; fi
+  for t in rules.v4 rules.v6; do
+    if [[ -e "$tmp/file.$t" ]]; then cp -a "$tmp/file.$t" "/etc/iptables/$t" || rok=0; else rm -f "/etc/iptables/$t" || rok=0; fi
+  done
   printf '%s\n' "$ref" > "$NTM_FAILED_STATE"; [[ -n "$tag" ]] && printf '%s\n' "$tag" > "$NTM_STATE"
+  if (( rok == 0 )); then
+    log "[ntm] CRITICAL: the firewall snapshot could not be fully restored (kept in $tmp) - MANUAL INTERVENTION NEEDED"
+    notify failed "CRITICAL: NTM ${ref:0:12} failed AND restoring the firewall snapshot failed; snapshot kept in $tmp"; return 2
+  fi
   if ntm_selftest "$iface"; then
     notify rollback "NTM ${ref:0:12} failed its checks; firewall restored, tunnel is UP. See $LOGFILE"; rm -rf "$tmp"; return 1
   fi
@@ -1039,8 +1052,31 @@ maybe_configure_bridge() {
     log "[bridge] could not download the setup script @ ${href:0:12}; will retry next run"; rm -rf "$tmp"; return 0
   fi
   log "[bridge] running the official bridge setup @ ${href:0:12} for $btag"
-  tar -C / -cpf "$tmp/etc-nym.tar" etc/nym 2>/dev/null && cp -a "$node" "$tmp/node.toml" \
-    || { log "[bridge] could not back up /etc/nym; not configuring"; rm -rf "$tmp"; return 1; }
+  # Backup of what the bridge runs on and the setup script changes: /etc/nym, the nym-node config,
+  # the bridge binaries (it installs the .deb over /usr/bin and links /usr/local/bin) and our drop-in.
+  # Not undone on a failure: the package stays registered with dpkg (removing it would stop and mask
+  # the bridge unit), with its files under /usr/lib and the firewall rules its postinst added.
+  local bins="" b di="/etc/systemd/system/$BRIDGE_UNIT.d" had_dropin=0 rok=1 p
+  for b in usr/bin/nym-bridge usr/bin/bridge-cfg usr/local/bin/nym-bridge usr/local/bin/bridge-cfg; do
+    if [[ -e "/$b" || -L "/$b" ]]; then bins="$bins $b"; fi
+  done
+  # shellcheck disable=SC2086
+  if ! { tar -C / -cpf "$tmp/etc-nym.tar" etc/nym && cp -a "$node" "$tmp/node.toml" && tar -C / -cpf "$tmp/bins.tar" $bins; }; then
+    log "[bridge] could not back up /etc/nym, the nym-node config and the bridge binaries; not configuring"; rm -rf "$tmp"; return 1
+  fi
+  # our drop-in may already exist (an earlier run): keep a copy to put back
+  if [[ -e "$di/nym-node-autoupdate.conf" ]]; then
+    had_dropin=1; cp -a "$di/nym-node-autoupdate.conf" "$tmp/dropin.conf" || { log "[bridge] could not back up the unit drop-in; not configuring"; rm -rf "$tmp"; return 1; }
+  fi
+  # nym-bridge 0.3 stops every listener, QUIC too, and exits 0 when TLS or SSH fails, which
+  # Restart=on-failure would not restart: Restart=always goes in first, or nothing is changed
+  if ! { mkdir -p "$di" && printf '[Service]\nRestart=always\nRestartSec=5\n' > "$di/.nym-node-autoupdate.conf.tmp" \
+         && mv -f "$di/.nym-node-autoupdate.conf.tmp" "$di/nym-node-autoupdate.conf" && systemctl daemon-reload \
+         && [[ "$(systemctl show -p Restart --value "$BRIDGE_UNIT" 2>/dev/null)" == always ]]; }; then
+    log "[bridge] could not set Restart=always on $BRIDGE_UNIT; not configuring"
+    bridge_put_dropin_back "$di" "$had_dropin" "$tmp/dropin.conf" || log "[bridge] CRITICAL: could not put the unit drop-in back"
+    rm -rf "$tmp"; return 1
+  fi
 
   if NONINTERACTIVE=1 NODE_CFG="$node" BRIDGE_TAG="$btag" DEBIAN_FRONTEND=noninteractive \
        timeout 900 bash "$tmp/setup.sh" full_bridge_setup </dev/null >> "$LOGFILE" 2>&1; then :
@@ -1055,24 +1091,106 @@ maybe_configure_bridge() {
     is_healthy "$BRIDGE_UNIT" "$BRIDGE_BIN" "" && bridge_listening "$BRIDGE_UNIT" "$BRIDGE_BIN" || { log "[bridge] check failed: the bridge is not up on every port"; ok=0; }
   fi
   if (( ok )); then
-    # nym-bridge 0.3 stops every listener, QUIC too, and exits 0 when one fails; Restart=on-failure
-    # would leave it down. Restart it whatever the exit code.
-    mkdir -p "/etc/systemd/system/$BRIDGE_UNIT.d" && printf '[Service]\nRestart=always\nRestartSec=5\n' \
-      > "/etc/systemd/system/$BRIDGE_UNIT.d/nym-node-autoupdate.conf" && systemctl daemon-reload || log "[bridge] WARN: could not add Restart=always"
+    # what a client needs: TLS and SSH answer with the published keys, and the host firewall lets them in
+    p="$(bridge_port tls_plain "$json")"; [[ -n "$p" ]] && bridge_check_tls "$p" "$json" && fw_port_open tcp "$p" || ok=0
+    p="$(bridge_port ssh_plain "$json")"; [[ -n "$p" ]] && bridge_check_ssh "$p" "$json" && fw_port_open tcp "$p" || ok=0
+  fi
+  if (( ok )); then
     printf '%s\n' "$key" > "$BRIDGE_CFG_STATE"; rm -f "$BRIDGE_CFG_FAILED"
-    log "[bridge] SUCCESS: TLS and SSH configured and published, QUIC key unchanged"
+    log "[bridge] SUCCESS: TLS and SSH serve the published keys and are let in, QUIC key unchanged"
     notify success "Bridge $btag: TLS/SSH configured and published"
     rm -rf "$tmp"; return 0
   fi
-  log "[bridge] restoring /etc/nym and the nym-node config from the backup"
+
+  log "[bridge] restoring /etc/nym, the nym-node config, the bridge binaries and the unit from the backup"
   systemctl stop "$BRIDGE_UNIT" 2>/dev/null || true
-  rm -rf /etc/nym && tar -C / -xpf "$tmp/etc-nym.tar" && cp -a "$tmp/node.toml" "$node" || log "[bridge] CRITICAL: restore of /etc/nym failed"
+  # /etc/nym: the backup is unpacked next to it first (same filesystem), then the two are swapped by
+  # rename. The live /etc/nym is never deleted before the restored one is in place; if the swap fails
+  # half way, the old one is renamed back and the result is CRITICAL.
+  local st="/etc/.nau-restore.$$" old="/etc/.nym.nau-failed.$$"
+  if mkdir "$st" && tar -C "$st" -xpf "$tmp/etc-nym.tar" && [[ -d "$st/etc/nym" ]]; then
+    if mv /etc/nym "$old"; then
+      if mv "$st/etc/nym" /etc/nym; then rm -rf "$old"
+      else rok=0; mv "$old" /etc/nym || log "[bridge] CRITICAL: /etc/nym is missing; the changed copy is $old"; fi
+    else rok=0; fi
+  else rok=0; log "[bridge] could not unpack the /etc/nym backup; /etc/nym left as the setup script left it"; fi
+  rm -rf "$st"
+  cp -a "$tmp/node.toml" "$node" || rok=0
+  for b in $bins; do rm -f "/$b" || rok=0; done
+  tar -C / -xpf "$tmp/bins.tar" || rok=0
+  bridge_put_dropin_back "$di" "$had_dropin" "$tmp/dropin.conf" || rok=0
   systemctl start "$BRIDGE_UNIT" 2>/dev/null || true
   printf '%s\n' "$key" > "$BRIDGE_CFG_FAILED"
-  if is_healthy "$BRIDGE_UNIT" "$BRIDGE_BIN" "" && bridge_listening "$BRIDGE_UNIT" "$BRIDGE_BIN"; then
-    notify rollback "Bridge TLS/SSH setup failed; /etc/nym restored, QUIC is up. See $LOGFILE"; rm -rf "$tmp"; return 1
+  if (( rok )) && is_healthy "$BRIDGE_UNIT" "$BRIDGE_BIN" "" && bridge_listening "$BRIDGE_UNIT" "$BRIDGE_BIN" \
+     && [[ "$(jq -r '.transports[]? | select(.transport_type=="quic_plain") | .args.id_pubkey' "$json" 2>/dev/null)" == "$q0" ]]; then
+    notify rollback "Bridge TLS/SSH setup failed; restored, QUIC is up. See $LOGFILE"; rm -rf "$tmp"; return 1
   fi
-  notify failed "CRITICAL: bridge setup failed AND the bridge is not back up after the restore"; rm -rf "$tmp"; return 2
+  log "[bridge] CRITICAL: the restore is incomplete or the bridge is not back (backup kept in $tmp) - MANUAL INTERVENTION NEEDED"
+  notify failed "CRITICAL: bridge setup failed AND the restore did not bring the bridge back; backup kept in $tmp"; return 2
+}
+
+bridge_port() {           # args: transport_type, client params ; the port it is published on
+  jq -r --arg t "$1" '.transports_v2[]? | select(.transport_type==$t) | .args.addresses[0] // empty' "$2" 2>/dev/null | sed -E 's/.*:([0-9]+)$/\1/'
+}
+# TLS on <port> serves the published key: the certificate's ed25519 key equals the tls_plain id_pubkey.
+bridge_check_tls() {      # args: port, client params
+  local want host got
+  want="$(jq -r '.transports_v2[]? | select(.transport_type=="tls_plain") | .args.id_pubkey' "$2")"
+  host="$(jq -r '.transports_v2[]? | select(.transport_type=="tls_plain") | .args.host // empty' "$2")"
+  got="$(timeout 10 openssl s_client -connect "127.0.0.1:$1" ${host:+-servername "$host"} </dev/null 2>/dev/null \
+         | openssl x509 -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | tail -c 32 | base64 -w0)"
+  [[ -n "$want" && "$got" == "$want" ]] && return 0
+  log "[bridge] check failed: TLS on tcp/$1 does not serve the published key"; return 1
+}
+# SSH on <port> answers SSH-2.0 and its ed25519 host key equals the ssh_plain id_pubkey.
+bridge_check_ssh() {      # args: port, client params
+  local want banner got
+  want="$(jq -r '.transports_v2[]? | select(.transport_type=="ssh_plain") | .args.id_pubkey' "$2")"
+  banner="$(timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1 && head -n1 <&3" 2>/dev/null | tr -d '\r')"
+  got="$(ssh-keyscan -T 5 -t ed25519 -p "$1" 127.0.0.1 2>/dev/null | awk '$2=="ssh-ed25519" {print $3; exit}' | base64 -d 2>/dev/null | tail -c 32 | base64 -w0)"
+  [[ "$banner" == SSH-2.0-* && -n "$want" && "$got" == "$want" ]] && return 0
+  log "[bridge] check failed: SSH on tcp/$1 does not serve the published key"; return 1
+}
+bridge_put_dropin_back() {     # args: drop-in dir, had one before (0|1), its copy ; then daemon-reload
+  if [[ "$2" == 1 ]]; then cp -a "$3" "$1/nym-node-autoupdate.conf" || return 1
+  else rm -f "$1/nym-node-autoupdate.conf" || return 1; fi
+  systemctl daemon-reload
+}
+
+# What INPUT decides for a NEW packet from any internet address to <proto>/<port>: the first rule, in
+# order, that applies to such a packet. Rules limited to a source, to loopback or the tunnel
+# interfaces, to replies, or to some packets (rate and set matches) do not apply. A jump to another
+# chain is not followed (such chains, like fail2ban's, hold source-specific rules). No rule: the policy.
+# args: iptables|ip6tables proto port ; stdout ACCEPT | DROP
+fw_decision() {
+  "$1" -w -S INPUT 2>/dev/null | awk -v P="$2" -v N="$3" '
+    function hasport(r,   s, a, k, j, b) {
+      if (!match(r, / --dports? [0-9,:]+/)) return 1
+      s = substr(r, RSTART, RLENGTH); sub(/ --dports? /, "", s); k = split(s, a, ",")
+      for (j = 1; j <= k; j++) { if (index(a[j], ":")) { split(a[j], b, ":"); if (N + 0 >= b[1] + 0 && N + 0 <= b[2] + 0) return 1 } else if (a[j] + 0 == N + 0) return 1 }
+      return 0 }
+    $1 == "-P" && $2 == "INPUT" { pol = $3; next }
+    $1 != "-A" { next }
+    { r = " " $0 " "
+      gsub(/ ! (-s|--source) [^ ]+/, " ", r)      # "not from X" applies to an arbitrary address
+      if (r ~ / (-s|--source) /) next
+      if (r ~ / ! /) next
+      if (r ~ / -i (lo|nym[a-z0-9]*) /) next
+      if (r ~ / --(ctstate|state) / && r !~ / --(ctstate|state) [A-Z,]*NEW/) next
+      if (r ~ / -m (hashlimit|recent|limit|set|connlimit|addrtype|owner|u32|string|time) /) next
+      if (r ~ / -p [^ ]+ / && r !~ (" -p " P " ")) next
+      if (!hasport(r)) next
+      if (r ~ / -j ACCEPT /) { print "ACCEPT"; found = 1; exit }
+      if (r ~ / -j (DROP|REJECT) /) { print "DROP"; found = 1; exit } }
+    END { if (!found) print (pol == "" ? "DROP" : pol) }'
+}
+# The host firewall lets <proto>/<port> in from anywhere, v4 and v6.
+fw_port_open() {          # args: proto port
+  local c
+  for c in iptables ip6tables; do
+    command -v "$c" >/dev/null 2>&1 || continue
+    [[ "$(fw_decision "$c" "$1" "$2")" == ACCEPT ]] || { log "[bridge] check failed: $c does not let $1/$2 in"; return 1; }
+  done
 }
 
 

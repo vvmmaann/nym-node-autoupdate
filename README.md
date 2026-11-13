@@ -51,14 +51,17 @@ demand. See [Nymi (Telegram alerts)](#nymi-telegram-alerts) below. **The node ne
   - **How:** the updater runs Nym's `quic_bridge_deployment.sh` from develop (pinned to its commit)
     non-interactively, for the installed bridge release. That script installs the bridge package and
     adds the TLS (tcp/4443) and SSH (tcp/4422) transports.
-  - **Backup first:** `/etc/nym` and the nym-node config.
+  - **Backup first:** `/etc/nym`, the nym-node config, the bridge binaries and the unit drop-in.
+    `Restart=always` is set before the script runs.
   - **Checks after the run:**
     - the bridge is up on every port;
     - the QUIC key is unchanged;
-    - TLS and SSH are published, and `transports` (read by older apps) is still QUIC only.
-  - **On failure:** both are put back and the bridge restarted.
-  - **After success:** a drop-in `Restart=always` is added. nym-bridge 0.3 stops QUIC too, exiting 0,
-    when TLS or SSH fails.
+    - TLS and SSH are published and answer with the published keys, and the host firewall lets
+      their ports in;
+    - `transports` (read by older apps) is still QUIC only.
+  - **On failure:** everything in the backup is put back and the bridge restarted. The installed
+    package stays registered with dpkg.
+  - nym-bridge 0.3 stops QUIC too, exiting 0, when TLS or SSH fails; `Restart=always` brings it back.
   - It runs again only when the bridge release or the setup script changes. `NYM_BRIDGE_CFG=0` keeps it
     off.
 

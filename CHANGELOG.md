@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.9.2 - 2026-11-13
+
+- **NTM.** Nothing is applied without a complete firewall snapshot (v4, v6 and the saved rule files). A
+  restore that does not fully succeed is reported as critical and keeps the snapshot.
+- **Bridge TLS/SSH.**
+  - The backup now also covers the bridge binaries, the links in `/usr/local/bin` and the unit
+    drop-in. On a failure they come back with `/etc/nym` and the nym-node config.
+  - The package installed by the setup script stays registered with dpkg.
+  - `Restart=always` is set before the setup script runs, or nothing is changed.
+  - An existing unit drop-in is backed up and put back on a failure.
+  - `/etc/nym` is restored next to the live one first and swapped in by rename; the live one is
+    never deleted before the restored one is in place.
+  - After the run, TLS and SSH must answer with the published keys, and the host firewall must let
+    their ports in.
+- **Firewall checks** (SSH after NTM, the bridge ports after the bridge setup) follow the INPUT rules in
+  order for a new connection from any address, the way the firewall decides.
+- **Binary rollback** needs the service to stop first, or it is not done (critical alert), and the
+  restored binary must be the one running.
+
 ## 1.9.1 - 2026-11-13
 
 Simpler: the updater now does what the operator notes say with Nym's own scripts, as an operator
