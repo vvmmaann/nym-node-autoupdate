@@ -127,7 +127,7 @@ NYMI_HUB_BASE="${NYM_NYMI_HUB:-https://nymcheckby.unclelem.uk/nymi}"
 
 SELF_PATH="$(readlink -f "$0")"
 DEST_PATH="/usr/local/sbin/nym-node-autoupdate.sh"
-SCRIPT_VERSION="1.9.3"
+SCRIPT_VERSION="1.9.4"
 SELF_UPDATE_URL="${NYM_SELF_UPDATE_URL:-https://raw.githubusercontent.com/vvmmaann/nym-node-autoupdate/main/nym-node-autoupdate.sh}"
 
 # --------------------------------- logging ----------------------------------
@@ -1867,7 +1867,14 @@ cmd_status() {
   echo "nym-node bin  : ${BIN:-<none found>}"
   echo "version       : $(bin_version "${BIN:-/bin/false}")"
   echo "role          : ${ROLE:-<unknown>}"
-  echo "active        : $(systemctl is-active "${UNIT:-nonexistent.service}" 2>/dev/null || true)"
+  # the unit's own scope (a user unit is not seen by plain systemctl); is-active prints one word
+  local act="none (no nym-node on this box)"
+  (( EUID == 0 )) || act="unknown (run as root)"
+  if [[ -n "${UNIT:-}" ]]; then
+    act="$(sctl is-active "$UNIT" 2>/dev/null | tail -n1 || true)"
+    [[ "$act" =~ ^[a-z-]+$ ]] || act="unknown (the ${SVC_SCOPE:-system} unit could not be queried; run as root)"
+  fi
+  echo "active        : $act"
   echo "node last_tag : $(cat "$STATE_TAG" 2>/dev/null || echo '<none>')"
   echo "node failed   : $(cut -f1 "$FAILED_TAGS" 2>/dev/null | tr '\n' ' ' || true)"
   local qp; qp="$(node_pps)"

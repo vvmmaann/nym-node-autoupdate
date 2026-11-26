@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.9.4 - 2026-11-26
+
+- **`status`** asks systemd in the unit's own scope, so a node run as a user service (`SVC_SCOPE=user`)
+  shows `active` instead of `inactive`. On a box without nym-node (nym-api only) it says so.
+
 ## 1.9.3 - 2026-11-13
 
 Roles follow Nym's table (operators docs, Ansible deploy).
